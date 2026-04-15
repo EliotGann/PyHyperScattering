@@ -46,6 +46,10 @@ bluesky = [
     "tiled[client]>=0.1.0a74",
     "bluesky-tiled-plugins"
 ]
+smi = [
+    "tiled[client]>=0.1.0a74",
+    "scikit-image",
+]
 performance = [
     "pyopencl",
     "dask",
