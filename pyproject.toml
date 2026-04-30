@@ -127,6 +127,9 @@ all = [
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"PyHyperScattering.data.smi.masks" = ["*.json"]
+
 [tool.versioneer]
 VCS = "git"
 style = "pep440"

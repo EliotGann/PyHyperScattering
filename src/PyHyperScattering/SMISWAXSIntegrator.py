@@ -75,6 +75,7 @@ class WAXSCalibration:
     theta_zero_deg: float = 0.0
     sample_offset_x_mm: float = 0.0
     sample_offset_z_mm: float = 0.0
+    beam_col_per_arc_deg: float = 0.0
     q_horizontal_sign: float = -1.0
     q_vertical_sign: float = -1.0
     rotation_k: int = 3
@@ -100,7 +101,16 @@ class WAXSCalibration:
         return specs
 
     def beam_center_at_angle(self, theta_deg: float) -> Tuple[float, float]:
-        return (float(self.beam_center_row), float(self.beam_center_col))
+        row = float(self.beam_center_row)
+        col = float(self.beam_center_col)
+        if self.sample_offset_x_mm != 0 or self.sample_offset_z_mm != 0:
+            th = np.deg2rad(theta_deg + self.theta_zero_deg)
+            dx_mm = (self.sample_offset_x_mm * (np.cos(th) - 1.0)
+                     - self.sample_offset_z_mm * np.sin(th))
+            col += dx_mm / self.pixel_size_mm
+        if self.beam_col_per_arc_deg != 0:
+            col += self.beam_col_per_arc_deg * theta_deg
+        return (row, col)
 
 
 # Default calibration matching legacy waxs_reduce._DEFAULT_CAL
@@ -341,8 +351,9 @@ def make_mask_for_angle(
     """Build a per-angle WAXS mask accounting for beamstop motor position."""
     polys = list(static_regions.values())
     if include_beamstop and beamstop_region:
-        dx_px = (waxs_bsx - waxs_bsx_ref) / pixel_size_mm
-        polys.append(shift_polygon(beamstop_region, dx_px=dx_px, dy_px=0.0))
+        bs_shift_mm = waxs_bsx - waxs_bsx_ref
+        bs_shift_px = (bs_shift_mm / pixel_size_mm) * 1.088  # empirical fudge factor
+        polys.append(shift_polygon(beamstop_region, dx_px=0.0, dy_px=bs_shift_px))
     raw_mask = polygons_to_mask(image_shape_raw, polys)
     mask_rot, _ = rotate_image_and_mask(raw_mask, k=rotation_k)
     return mask_rot
@@ -400,7 +411,7 @@ def make_saxs_mask_from_spec(
 def make_waxs_mask_callable(
     mask_path: str | Path,
     waxs_bsx_ref: float = 0.0,
-    beamstop_max_abs_arc_deg: float | None = 6.0,
+    beamstop_max_abs_arc_deg: float | None = 15.0,
 ):
     """Return ``mask_fn(image_shape_raw, theta_deg, waxs_bsx) → bool mask``."""
     with open(mask_path) as f:
@@ -439,6 +450,263 @@ def make_waxs_mask_callable(
     return mask_fn
 
 
+# ===================================================================
+# Single-frame mask convenience (browser / notebook helper)
+# ===================================================================
+
+def _smi_run_field_at(run: Any, field: str, frame_idx: int) -> float:
+    """Return ``run.primary[field][frame_idx]`` as a Python float.
+
+    Tolerates several access patterns so it works against bluesky/tiled
+    runs *and* dict-like fakes in tests::
+
+        run["primary"]["data"][field]              # tiled, bluesky-tiled
+        run["primary"][field]                      # legacy tiled
+        run.primary[field]                         # attribute-style
+        run["primary"].read()[field]               # full read fallback
+        run[field]                                 # bare dict fallback (tests)
+    """
+    primary = None
+    try:
+        primary = run["primary"]
+    except Exception:
+        primary = getattr(run, "primary", None)
+
+    candidates = []
+    if primary is not None:
+        # bluesky-tiled: primary/data/<field>
+        try:
+            candidates.append(primary["data"][field])
+        except Exception:
+            pass
+        try:
+            candidates.append(primary[field])
+        except Exception:
+            pass
+        try:
+            candidates.append(getattr(primary, field))
+        except Exception:
+            pass
+    # Bare dict-like at top level (used by simple test fakes)
+    try:
+        candidates.append(run[field])
+    except Exception:
+        pass
+
+    for node in candidates:
+        if node is None:
+            continue
+        try:
+            values = node.read() if hasattr(node, "read") else node
+            arr = np.asarray(values).reshape(-1)
+            if arr.size == 0:
+                continue
+            idx = int(frame_idx) if arr.size > 1 else 0
+            return float(arr[idx])
+        except Exception:
+            continue
+
+    # Fall back to a full primary.read() — slower, but always correct.
+    if primary is not None:
+        try:
+            ds = primary.read()
+            arr = np.asarray(ds[field].values).reshape(-1)
+            idx = int(frame_idx) if arr.size > 1 else 0
+            return float(arr[idx])
+        except Exception:
+            pass
+
+    raise KeyError(field)
+
+
+def _smi_run_raw_shape(run: Any, image_field: str) -> tuple[int, int]:
+    """Return ``(rows, cols)`` of one frame without downloading the data."""
+    primary = None
+    try:
+        primary = run["primary"]
+    except Exception:
+        primary = getattr(run, "primary", None)
+
+    nodes = []
+    if primary is not None:
+        try:
+            nodes.append(primary["data"][image_field])
+        except Exception:
+            pass
+        try:
+            nodes.append(primary[image_field])
+        except Exception:
+            pass
+    try:
+        nodes.append(run[image_field])
+    except Exception:
+        pass
+
+    for node in nodes:
+        try:
+            shp = tuple(getattr(node, "shape", ()))
+            if len(shp) >= 2:
+                return (int(shp[-2]), int(shp[-1]))
+        except Exception:
+            continue
+    raise KeyError(f"could not determine shape of {image_field!r} on run")
+
+
+def mask_for_frame(
+    run_or_uid: Any,
+    frame_idx: int,
+    detector: str,
+    *,
+    mask_path: str | Path | None = None,
+    orient_for_display: bool = False,
+    tiled_uri: str | None = None,
+    catalog: str | None = None,
+    raw_shape: tuple[int, int] | None = None,
+    beamstop_max_abs_arc_deg: float | None = 15.0,
+) -> np.ndarray:
+    """Return the boolean validity mask (True = valid) for one frame.
+
+    Thin wrapper over :func:`make_saxs_mask_from_spec` /
+    :func:`make_waxs_mask_callable` that pulls the per-frame motor
+    positions a browser/notebook would otherwise have to fetch by hand.
+
+    Parameters
+    ----------
+    run_or_uid
+        A bluesky/tiled run object, **or** a uid string.  If a string is
+        given, ``tiled_uri`` and ``catalog`` are used to resolve it
+        (defaults from :mod:`PyHyperScattering.smi_defaults`).
+    frame_idx : int
+        Frame index along the scan axis (e.g. ``waxs_arc``).  Ignored for
+        SAXS in current SMI configuration but accepted for symmetry.
+    detector : {'saxs', 'waxs'}
+        Which detector's mask to build.
+    mask_path : str | Path | None, optional
+        Polygon-mask JSON path.  ``None`` selects the bundled default
+        from :func:`smi_defaults.resolve_mask_path`.
+    orient_for_display : bool, optional
+        If True, return the mask already aligned with
+        :func:`smi_defaults.orient_frame_for_display`.  For WAXS the
+        underlying mask builder *already* returns a display-oriented
+        array (it applies ``np.fliplr(np.rot90(..., k=3))`` internally),
+        so no extra orientation pass is performed in that case.
+    tiled_uri, catalog : str | None
+        Used only when ``run_or_uid`` is a uid string.
+    raw_shape : tuple[int, int] | None
+        Override for the raw detector shape ``(rows, cols)``.  Useful for
+        testing; normally read from the run's primary stream metadata.
+    beamstop_max_abs_arc_deg : float | None
+        Forwarded to :func:`make_waxs_mask_callable`.
+
+    Returns
+    -------
+    np.ndarray[bool]
+        Boolean mask, ``True`` where the pixel is valid for integration.
+
+    Raises
+    ------
+    KeyError
+        If WAXS is requested and ``waxs_arc`` / ``waxs_bsx`` cannot be
+        located on the run's primary stream.
+    ValueError
+        If ``detector`` is not ``'saxs'`` or ``'waxs'``.
+    """
+    from PyHyperScattering.smi_defaults import (
+        DEFAULT_TILED_URI as _DEFAULT_TILED_URI,
+        DEFAULT_CATALOG as _DEFAULT_CATALOG,
+        SAXS_IMAGE_FIELD as _SAXS_IMAGE_FIELD,
+        WAXS_IMAGE_FIELD as _WAXS_IMAGE_FIELD,
+        WAXS_ARC_FIELD as _WAXS_ARC_FIELD,
+        WAXS_BSX_FIELD as _WAXS_BSX_FIELD,
+        BSX_PER_ARC_DEG as _BSX_PER_ARC_DEG_PUBLIC,
+        orient_frame_for_display as _orient_frame_for_display,
+        resolve_mask_path as _resolve_mask_path,
+    )
+
+    det = str(detector).lower()
+    if det not in ("saxs", "waxs"):
+        raise ValueError(f"detector must be 'saxs' or 'waxs', got {detector!r}")
+
+    # Resolve uid → run if necessary.
+    if isinstance(run_or_uid, str):
+        from tiled.client import from_uri  # heavy, lazy
+        cat_path = catalog or _DEFAULT_CATALOG
+        uri = tiled_uri or _DEFAULT_TILED_URI
+        run = from_uri(uri)[cat_path][run_or_uid]
+    else:
+        run = run_or_uid
+
+    image_field = _SAXS_IMAGE_FIELD if det == "saxs" else _WAXS_IMAGE_FIELD
+    if raw_shape is None:
+        raw_shape = _smi_run_raw_shape(run, image_field)
+    raw_shape = (int(raw_shape[0]), int(raw_shape[1]))
+
+    resolved_mask_path = _resolve_mask_path(mask_path, detector=det)
+
+    if det == "saxs":
+        # Pull the actual active beamstop + per-run motor positions from
+        # the run's baseline / configuration so the dynamic mask reflects
+        # this scan's geometry, not just the polygon file's reference
+        # positions.  Falls back gracefully if the resolver fails (e.g.
+        # mocked test runs without a baseline).
+        active_bs = "rod"
+        bs_pos: dict | None = None
+        saxs_geo = None
+        try:
+            from PyHyperScattering.SMISWAXSLoader import resolve_saxs_geometry
+            saxs_geo = resolve_saxs_geometry(run)
+            active_bs = saxs_geo.active_beamstop or "rod"
+            bs_pos = saxs_geo.beamstop_pos_mm
+        except Exception:
+            pass
+
+        mask = make_saxs_mask_from_spec(
+            image_shape=raw_shape,
+            mask_path=resolved_mask_path,
+            active_beamstop=active_bs,
+            beamstop_pos_mm=bs_pos,
+        )
+
+        # AND in the per-frame WAXS-shadow occlusion (depends on
+        # ``waxs_arc``).  This is the same shadow that
+        # ``_integrate_saxs_batch`` applies during full reduction, so the
+        # dynamic-mask overlay matches what the integrator actually sees.
+        # Skipped silently if waxs_arc / beam_center are unavailable
+        # (e.g. SAXS-only runs without the WAXS arc motor).
+        try:
+            waxs_arc = _smi_run_field_at(run, _WAXS_ARC_FIELD, frame_idx)
+            beam_col = (
+                saxs_geo.beam_center_col_px
+                if saxs_geo is not None else None
+            )
+            if waxs_arc is not None and beam_col is not None:
+                shadow = _make_waxs_shadow_mask(
+                    raw_shape, [float(waxs_arc)], float(beam_col),
+                )[0]
+                mask = mask & shadow
+        except Exception:
+            pass
+
+        if orient_for_display:
+            mask = _orient_frame_for_display(mask, "saxs")
+        return mask
+
+    # WAXS: pull arc + bsx, derive bsx_ref via the SMI mechanical linkage.
+    waxs_arc = _smi_run_field_at(run, _WAXS_ARC_FIELD, frame_idx)
+    waxs_bsx = _smi_run_field_at(run, _WAXS_BSX_FIELD, frame_idx)
+    waxs_bsx_ref = waxs_bsx - _BSX_PER_ARC_DEG_PUBLIC * waxs_arc
+
+    mask_fn = make_waxs_mask_callable(
+        resolved_mask_path,
+        waxs_bsx_ref=waxs_bsx_ref,
+        beamstop_max_abs_arc_deg=beamstop_max_abs_arc_deg,
+    )
+    # ``make_waxs_mask_callable`` returns a mask already in the display
+    # orientation (rot90+fliplr applied inside ``make_mask_for_angle``).
+    # Therefore for WAXS we never reapply ``orient_frame_for_display``.
+    return mask_fn(raw_shape, theta_deg=waxs_arc, waxs_bsx=waxs_bsx)
+
+
 # SAXS large-area masks (WAXS shadow + aperture)
 _DEFAULT_SAXS_WAXS_SHADOW = {
     "enabled": True,
@@ -450,7 +718,7 @@ _DEFAULT_SAXS_WAXS_SHADOW = {
 _DEFAULT_SAXS_APERTURE = {
     "enabled": True,
     "agbh_ring_order": 5,
-    "q_margin_fraction": 0.08,
+    "q_margin_fraction": 0.01,
     "q_cutoff": None,
 }
 
@@ -614,13 +882,51 @@ def _interp_axis(source_axis, values, target_axis, fill_value):
     return out
 
 
+def _empty_qchi_like(ref: xr.Dataset) -> xr.Dataset:
+    """Return a zero-count q-chi dataset with the same grid as *ref*."""
+    q = ref["q"].values
+    chi = ref["chi"].values
+    nq, nc = len(q), len(chi)
+    return xr.Dataset(
+        {
+            "intensity": (("q", "chi"), np.full((nq, nc), np.nan)),
+            "counts":    (("q", "chi"), np.zeros((nq, nc))),
+        },
+        coords={"q": q, "chi": chi},
+    )
+
+
+def _empty_iq_like(ref: xr.Dataset) -> xr.Dataset:
+    """Return a NaN I(q) dataset with the same q grid as *ref*."""
+    q = ref["q"].values
+    return xr.Dataset(
+        {
+            "I":      ("q", np.full(len(q), np.nan)),
+            "counts": ("q", np.zeros(len(q))),
+        },
+        coords={"q": q},
+    )
+
+
 def merge_q_chi_weighted(
-    saxs_qchi: xr.Dataset,
-    waxs_qchi: xr.Dataset,
+    saxs_qchi: xr.Dataset | None,
+    waxs_qchi: xr.Dataset | None,
     n_q: int = 1000,
     n_chi: int = 360,
-) -> xr.Dataset:
-    """Merge SAXS and WAXS q-chi maps on a common grid with count-weighting."""
+) -> xr.Dataset | None:
+    """Merge SAXS and WAXS q-chi maps on a common grid with count-weighting.
+
+    Returns None if both inputs are None. Returns the single detector's data
+    (re-gridded) if only one is present.
+    """
+    if saxs_qchi is None and waxs_qchi is None:
+        return None
+    # Single-detector passthrough: use the available one for both slots
+    if saxs_qchi is None:
+        saxs_qchi = _empty_qchi_like(waxs_qchi)
+    if waxs_qchi is None:
+        waxs_qchi = _empty_qchi_like(saxs_qchi)
+
     saxs_q = np.asarray(saxs_qchi["q"].values, dtype=float)
     waxs_q = np.asarray(waxs_qchi["q"].values, dtype=float)
     q_min = min(float(np.nanmin(saxs_q)), float(np.nanmin(waxs_q)))
@@ -638,19 +944,21 @@ def merge_q_chi_weighted(
     waxs_I = np.asarray(waxs_qchi["intensity"].values, dtype=float)
     waxs_N = np.asarray(waxs_qchi["counts"].values, dtype=float)
 
-    s_I_interp = np.full((n_q, n_chi), np.nan, dtype=float)
-    s_N_interp = np.zeros((n_q, n_chi), dtype=float)
-    w_I_interp = np.full((n_q, n_chi), np.nan, dtype=float)
-    w_N_interp = np.zeros((n_q, n_chi), dtype=float)
+    def _regrid_2d(src_q, src_chi, data, target_q, target_chi, fill):
+        """Regrid a 2D (q, chi) array onto a new grid via nearest-neighbor."""
+        from scipy.interpolate import RegularGridInterpolator
+        finite_data = np.where(np.isfinite(data), data, fill)
+        interp = RegularGridInterpolator(
+            (src_q, src_chi), finite_data,
+            method="nearest", bounds_error=False, fill_value=fill,
+        )
+        tq, tc = np.meshgrid(target_q, target_chi, indexing="ij")
+        return interp((tq, tc))
 
-    for j in range(saxs_I.shape[1]):
-        idx = min(j, len(chi_grid) - 1)
-        s_I_interp[:, idx] = _interp_axis(saxs_q, saxs_I[:, j], q_grid, np.nan)
-        s_N_interp[:, idx] = _interp_axis(saxs_q, saxs_N[:, j], q_grid, 0.0)
-    for j in range(waxs_I.shape[1]):
-        idx = min(j, len(chi_grid) - 1)
-        w_I_interp[:, idx] = _interp_axis(waxs_q, waxs_I[:, j], q_grid, np.nan)
-        w_N_interp[:, idx] = _interp_axis(waxs_q, waxs_N[:, j], q_grid, 0.0)
+    s_I_interp = _regrid_2d(saxs_q, saxs_chi, saxs_I, q_grid, chi_grid, np.nan)
+    s_N_interp = _regrid_2d(saxs_q, saxs_chi, saxs_N, q_grid, chi_grid, 0.0)
+    w_I_interp = _regrid_2d(waxs_q, waxs_chi, waxs_I, q_grid, chi_grid, np.nan)
+    w_N_interp = _regrid_2d(waxs_q, waxs_chi, waxs_N, q_grid, chi_grid, 0.0)
 
     total_N = s_N_interp + w_N_interp
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -675,11 +983,13 @@ def merge_q_chi_weighted(
 
 
 def merge_iq_profiles(
-    merged_qchi: xr.Dataset,
-    saxs_iq: xr.Dataset,
-    waxs_iq: xr.Dataset,
-) -> xr.Dataset:
+    merged_qchi: xr.Dataset | None,
+    saxs_iq: xr.Dataset | None,
+    waxs_iq: xr.Dataset | None,
+) -> xr.Dataset | None:
     """Produce merged I(q) by azimuthal integration of the merged q-chi map."""
+    if merged_qchi is None:
+        return None
     q_grid = np.asarray(merged_qchi["q"].values, dtype=float)
     merged_I = np.asarray(merged_qchi["intensity"].values, dtype=float)
     merged_N = np.asarray(merged_qchi["counts"].values, dtype=float)
@@ -692,13 +1002,19 @@ def merge_iq_profiles(
             np.nan,
         )
 
-    saxs_q_src = np.asarray(saxs_iq["q"].values, dtype=float)
-    saxs_I_src = np.asarray(saxs_iq["I"].values, dtype=float)
-    waxs_q_src = np.asarray(waxs_iq["q"].values, dtype=float)
-    waxs_I_src = np.asarray(waxs_iq["I"].values, dtype=float)
+    if saxs_iq is not None:
+        saxs_q_src = np.asarray(saxs_iq["q"].values, dtype=float)
+        saxs_I_src = np.asarray(saxs_iq["I"].values, dtype=float)
+        saxs_I_interp = _interp_axis(saxs_q_src, saxs_I_src, q_grid, np.nan)
+    else:
+        saxs_I_interp = np.full(len(q_grid), np.nan)
 
-    saxs_I_interp = _interp_axis(saxs_q_src, saxs_I_src, q_grid, np.nan)
-    waxs_I_interp = _interp_axis(waxs_q_src, waxs_I_src, q_grid, np.nan)
+    if waxs_iq is not None:
+        waxs_q_src = np.asarray(waxs_iq["q"].values, dtype=float)
+        waxs_I_src = np.asarray(waxs_iq["I"].values, dtype=float)
+        waxs_I_interp = _interp_axis(waxs_q_src, waxs_I_src, q_grid, np.nan)
+    else:
+        waxs_I_interp = np.full(len(q_grid), np.nan)
 
     return xr.Dataset(
         {
@@ -711,21 +1027,610 @@ def merge_iq_profiles(
     )
 
 
+# -------------------------------------------------------------------
+# Multi-scan merging
+# -------------------------------------------------------------------
+
+def merge_multiple_qchi(
+    datasets: list[xr.Dataset],
+    n_q: int = 2000,
+    n_chi: int = 360,
+) -> xr.Dataset:
+    """Count-weighted merge of N ``(q, chi)`` datasets onto a common grid.
+
+    Each input must have ``intensity`` and ``counts`` variables with
+    dimensions ``(q, chi)``.  The output grid spans the union of all
+    input q/chi ranges.
+    """
+    from scipy.interpolate import RegularGridInterpolator
+
+    if not datasets:
+        raise ValueError("Need at least one dataset to merge")
+    if len(datasets) == 1:
+        return datasets[0]
+
+    all_q = [np.asarray(ds["q"].values, dtype=float) for ds in datasets]
+    all_chi = [np.asarray(ds["chi"].values, dtype=float) for ds in datasets]
+    q_min = min(float(q.min()) for q in all_q)
+    q_max = max(float(q.max()) for q in all_q)
+    chi_min = min(float(c.min()) for c in all_chi)
+    chi_max = max(float(c.max()) for c in all_chi)
+    q_grid = np.linspace(q_min, q_max, n_q)
+    chi_grid = np.linspace(chi_min, chi_max, n_chi)
+    tq, tc = np.meshgrid(q_grid, chi_grid, indexing="ij")
+    pts = (tq, tc)
+
+    accum_IN = np.zeros((n_q, n_chi), dtype=float)
+    accum_N = np.zeros((n_q, n_chi), dtype=float)
+
+    for ds, src_q, src_chi in zip(datasets, all_q, all_chi):
+        I_src = np.asarray(ds["intensity"].values, dtype=float)
+        N_src = np.asarray(ds["counts"].values, dtype=float)
+
+        N_fill = np.where(np.isfinite(N_src), N_src, 0.0)
+        IN_src = np.where(np.isfinite(I_src), I_src * N_fill, 0.0)
+
+        interp_N = RegularGridInterpolator(
+            (src_q, src_chi), N_fill,
+            method="nearest", bounds_error=False, fill_value=0.0,
+        )
+        interp_IN = RegularGridInterpolator(
+            (src_q, src_chi), IN_src,
+            method="nearest", bounds_error=False, fill_value=0.0,
+        )
+        accum_N += interp_N(pts)
+        accum_IN += interp_IN(pts)
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        merged_I = np.where(accum_N > 0, accum_IN / accum_N, np.nan)
+
+    return xr.Dataset(
+        {
+            "intensity": (("q", "chi"), merged_I),
+            "counts": (("q", "chi"), accum_N),
+        },
+        coords={"q": q_grid, "chi": chi_grid},
+    )
+
+
+def merge_multiple_iq(
+    merged_qchi: xr.Dataset,
+) -> xr.Dataset:
+    """Azimuthally average a merged q-chi map into I(q)."""
+    q_grid = np.asarray(merged_qchi["q"].values, dtype=float)
+    merged_I = np.asarray(merged_qchi["intensity"].values, dtype=float)
+    merged_N = np.asarray(merged_qchi["counts"].values, dtype=float)
+
+    total_N = merged_N.sum(axis=1)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        I_1d = np.where(
+            total_N > 0,
+            (np.nan_to_num(merged_I, nan=0.0) * merged_N).sum(axis=1) / total_N,
+            np.nan,
+        )
+    return xr.Dataset(
+        {"I": ("q", I_1d), "counts": ("q", total_N)},
+        coords={"q": q_grid},
+    )
+
+
+def merge_reduction_results(
+    *results: "CombinedReductionResult",
+    n_q: int = 2000,
+    n_chi: int = 360,
+) -> Tuple[xr.Dataset, xr.Dataset]:
+    """Merge multiple :class:`CombinedReductionResult` objects.
+
+    Collects the per-scan merged q-chi maps and combines them with
+    count-weighting.
+
+    Returns ``(merged_qchi, merged_iq)``.
+    """
+    qchi_list = [r.merged_qchi for r in results if r.merged_qchi is not None]
+    if not qchi_list:
+        raise ValueError("No merged q-chi data in any of the results")
+    merged_qchi = merge_multiple_qchi(qchi_list, n_q=n_q, n_chi=n_chi)
+    merged_iq = merge_multiple_iq(merged_qchi)
+    return merged_qchi, merged_iq
+
+
 # ===================================================================
-# Result dataclass
+# Result dataclasses
 # ===================================================================
 
 @dataclass(frozen=True)
 class CombinedReductionResult:
     uid: str
     scan_info: dict[str, Any]
-    saxs: dict[str, Any]
-    waxs: dict[str, Any]
-    merged_qchi: xr.Dataset
-    merged_iq: xr.Dataset
+    saxs: dict[str, Any] | None
+    waxs: dict[str, Any] | None
+    merged_qchi: xr.Dataset | None
+    merged_iq: xr.Dataset | None
     timing: dict[str, float] | None = None
     geometry: str = "transmission"
     incident_angle_deg: float = 0.0
+
+
+@dataclass(frozen=True)
+class GIReductionResult:
+    """Result of a grazing-incidence WAXS reduction.
+
+    Attributes
+    ----------
+    uid : str
+        Tiled run UID.
+    sample_name : str
+        Sample name from the start document.
+    scan_motor : str
+        Name of the scanned motor (e.g. ``'piezo_th'``).
+    scan_motor_values : np.ndarray
+        Per-frame values of the scanned motor.
+    alpha_i_deg : np.ndarray
+        Per-frame incident angle (degrees).
+    alpha_i_source : str
+        Description of how alpha_i was determined.
+    qxy_grid : np.ndarray
+        1-D q_xy bin centres (nm\ :sup:`-1`).
+    qz_grid : np.ndarray
+        1-D q_z bin centres (nm\ :sup:`-1`).
+    frames : list[np.ndarray]
+        Per-frame I(qxy, qz) images (shape ``(n_qxy, n_qz)``).
+    summed : np.ndarray
+        Averaged I(qxy, qz) over all frames.
+    timing : dict[str, float] | None
+        Timing breakdown.
+    """
+    uid: str
+    sample_name: str
+    scan_motor: str
+    scan_motor_values: np.ndarray
+    alpha_i_deg: np.ndarray
+    alpha_i_source: str
+    qxy_grid: np.ndarray
+    qz_grid: np.ndarray
+    frames: list  # list[np.ndarray]
+    summed: np.ndarray
+    timing: dict[str, float] | None = None
+
+    # -- Line cut helpers --------------------------------------------------
+
+    def line_cut_qxy(self, qz_center: float, qz_width: float = 0.05,
+                     frame: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """I(qxy) at constant qz +/- width.  *frame*=None uses the sum."""
+        img = self.summed if frame is None else self.frames[frame]
+        mask = (self.qz_grid >= qz_center - qz_width) & (self.qz_grid <= qz_center + qz_width)
+        if not mask.any():
+            return self.qxy_grid, np.full_like(self.qxy_grid, np.nan)
+        return self.qxy_grid, np.nanmean(img[:, mask], axis=1)
+
+    def line_cut_qz(self, qxy_center: float, qxy_width: float = 0.1,
+                    frame: int | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """I(qz) at constant qxy +/- width.  *frame*=None uses the sum."""
+        img = self.summed if frame is None else self.frames[frame]
+        mask = (self.qxy_grid >= qxy_center - qxy_width) & (self.qxy_grid <= qxy_center + qxy_width)
+        if not mask.any():
+            return self.qz_grid, np.full_like(self.qz_grid, np.nan)
+        return self.qz_grid, np.nanmean(img[mask, :], axis=0)
+
+
+# ===================================================================
+# Grazing-incidence helpers
+# ===================================================================
+
+def lab_to_sample_frame(
+    qx_lab: np.ndarray,
+    qy_lab: np.ndarray,
+    qz_lab: np.ndarray,
+    alpha_i_deg: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Rotate lab-frame q into the sample frame for grazing incidence.
+
+    Parameters
+    ----------
+    qx_lab, qy_lab, qz_lab : ndarray
+        Lab-frame q components (horizontal, vertical-up, along-beam).
+    alpha_i_deg : float
+        Incident angle in degrees.
+
+    Returns
+    -------
+    (qx_s, qy_s, qz_s) where qz_s is along the surface normal.
+    """
+    ai = np.deg2rad(alpha_i_deg)
+    cos_ai = np.cos(ai)
+    sin_ai = np.sin(ai)
+    qx_s = qx_lab
+    qy_s = qy_lab * sin_ai - qz_lab * cos_ai
+    qz_s = qy_lab * cos_ai + qz_lab * sin_ai
+    return qx_s, qy_s, qz_s
+
+
+import re as _re
+
+_AI_PATTERNS = [
+    _re.compile(r'(?:^|[_\-])ai[_\-]?([0-9]+\.?[0-9]*)', _re.IGNORECASE),
+    _re.compile(r'alpha[_]?i?[_\-]?([0-9]+\.?[0-9]*)', _re.IGNORECASE),
+    _re.compile(r'incident[_\-]?([0-9]+\.?[0-9]*)', _re.IGNORECASE),
+]
+
+
+def parse_incident_angle_from_string(s: str) -> float | None:
+    """Extract incident angle (degrees) from a sample-name string.
+
+    Recognized patterns (case-insensitive):
+    ``ai0.12``, ``ai_0.12``, ``alpha0.12``, ``alpha_i0.12``, ``incident0.12``.
+
+    Returns ``float`` or ``None``.
+    """
+    for pat in _AI_PATTERNS:
+        m = pat.search(s)
+        if m:
+            val = float(m.group(1))
+            if 0 < val < 90:
+                return val
+    return None
+
+
+def find_incident_angle(
+    run,
+    n_frames: int,
+    manual_override: float | None = None,
+    theta_offset: float = 0.0,
+) -> tuple[np.ndarray, str]:
+    """Determine per-frame incident angle (degrees).
+
+    Only fetches individual columns from tiled — never reads the full
+    primary stream.
+
+    Priority order:
+    1. ``manual_override`` if not None
+    2. ``sample_name`` string parsing (``ai0.12`` etc.)
+    3. Motor positions: ``stage_th + piezo_th + theta_offset``
+
+    Returns ``(alpha_i_array, source_description)``.
+    """
+    start = run.metadata.get("start", {})
+    sample_name = start.get("sample_name", "")
+
+    if manual_override is not None:
+        return np.full(n_frames, float(manual_override)), \
+            f"manual override = {manual_override}\u00b0"
+
+    ai_from_name = parse_incident_angle_from_string(sample_name)
+    if ai_from_name is not None:
+        return np.full(n_frames, ai_from_name), \
+            f"sample_name parsed: ai={ai_from_name}\u00b0"
+
+    # Motor positions — fetch individual columns only
+    primary_ds = run["primary"]
+    baseline_ds = run["baseline"]
+
+    stage_th = None
+    try:
+        stage_th = float(baseline_ds["stage_th"].read()[0])
+    except (KeyError, IndexError):
+        pass
+
+    piezo_th = None
+    if "piezo_th" in primary_ds:
+        piezo_th = np.asarray(primary_ds["piezo_th"].read(), dtype=float)
+    else:
+        try:
+            piezo_th = np.full(n_frames, float(baseline_ds["piezo_th"].read()[0]))
+        except (KeyError, IndexError):
+            pass
+
+    if stage_th is not None and piezo_th is not None:
+        ai = stage_th + piezo_th + theta_offset
+        return ai, f"stage_th({stage_th:.4f}) + piezo_th + offset({theta_offset})"
+
+    if piezo_th is not None:
+        return piezo_th + theta_offset, \
+            f"piezo_th + offset({theta_offset}) [no stage_th]"
+
+    raise RuntimeError(
+        "Cannot determine incident angle. Pass incident_angle_deg manually."
+    )
+
+
+def integrate_waxs_gi(
+    waxs_raw: xr.DataArray,
+    mask_fn,
+    alpha_i_deg: np.ndarray,
+    n_qxy: int = 500,
+    n_qz: int = 500,
+    cal: WAXSCalibration | None = None,
+    dezinger_threshold: float | None = None,
+    dezinger_kernel: int = 5,
+) -> dict[str, Any]:
+    """WAXS GI reduction: bin each frame into (qxy, qz) in the sample frame.
+
+    Parameters
+    ----------
+    waxs_raw : xr.DataArray
+        Raw WAXS images from ``TiledSMISWAXSLoader.loadSingleImage``.
+    mask_fn : callable or None
+        ``mask_fn(image_shape_raw, theta_deg, waxs_bsx) -> bool mask``.
+    alpha_i_deg : array-like
+        Per-frame incident angle (degrees).
+    n_qxy, n_qz : int
+        Grid dimensions.
+    cal : WAXSCalibration or None
+        Detector calibration.  None uses ``_DEFAULT_CAL``.
+    dezinger_threshold, dezinger_kernel
+        Hot-pixel rejection parameters.
+
+    Returns
+    -------
+    dict with keys ``qxy_grid``, ``qz_grid``, ``frames``, ``summed``.
+    """
+    if cal is None:
+        cal = WAXSCalibration(**_DEFAULT_CAL)
+
+    images = np.asarray(waxs_raw.values, dtype=float)
+    if images.ndim == 2:
+        images = images[np.newaxis, :, :]
+    n_frames = images.shape[0]
+
+    arc_angles = np.asarray(
+        waxs_raw.coords[waxs_raw.dims[0]].values, dtype=float,
+    )
+    bsx_per_frame = np.asarray(
+        waxs_raw.attrs.get("smi_waxs_bsx_per_frame", [0.0] * n_frames),
+        dtype=float,
+    )
+    alpha_arr = np.asarray(alpha_i_deg, dtype=float)
+    if alpha_arr.size == 1:
+        alpha_arr = np.full(n_frames, float(alpha_arr))
+
+    # Build detector geometry (constant arc for GI scans)
+    img_0_rot, _ = rotate_image_and_mask(images[0], k=cal.rotation_k)
+    rot_shape = img_0_rot.shape
+    theta_arc = float(arc_angles[0])
+    bc = cal.beam_center_at_angle(theta_arc)
+    det = MultiPanelArcDetector(
+        image_shape=rot_shape,
+        panel_specs=cal.make_panel_specs(),
+        wavelength_nm=cal.wavelength_nm,
+        pixel_size_mm=cal.pixel_size_mm,
+        sample_distance_mm=cal.sample_distance_mm,
+        beam_center_px=bc,
+        theta_zero_deg=cal.theta_zero_deg,
+        sample_offset_x_mm=cal.sample_offset_x_mm,
+        sample_offset_z_mm=cal.sample_offset_z_mm,
+    )
+    qds = det.qmap(theta_arc)
+    # Apply the same sign conventions as the transmission code so that
+    # "up" in the lab frame is positive qy.
+    qx_lab = cal.q_horizontal_sign * np.asarray(qds["qx"].values, dtype=float)
+    qy_lab = cal.q_vertical_sign * np.asarray(qds["qy"].values, dtype=float)
+    qz_lab_arr = np.asarray(qds["qz"].values, dtype=float)
+
+    # --- First pass: global qxy/qz range ---
+    _qxy_mn, _qxy_mx, _qz_mn, _qz_mx = [], [], [], []
+    for fi in range(n_frames):
+        qx_s, qy_s, qz_s = lab_to_sample_frame(
+            qx_lab, qy_lab, qz_lab_arr, alpha_arr[fi],
+        )
+        qxy = np.sign(qx_s) * np.sqrt(qx_s ** 2 + qy_s ** 2)
+        ok = np.isfinite(qxy) & np.isfinite(qz_s)
+        if ok.any():
+            _qxy_mn.append(float(np.nanmin(qxy[ok])))
+            _qxy_mx.append(float(np.nanmax(qxy[ok])))
+            _qz_mn.append(float(np.nanmin(qz_s[ok])))
+            _qz_mx.append(float(np.nanmax(qz_s[ok])))
+
+    qxy_edges = np.linspace(min(_qxy_mn), max(_qxy_mx), n_qxy + 1)
+    qz_edges = np.linspace(min(_qz_mn), max(_qz_mx), n_qz + 1)
+    qxy_grid = 0.5 * (qxy_edges[:-1] + qxy_edges[1:])
+    qz_grid = 0.5 * (qz_edges[:-1] + qz_edges[1:])
+
+    # --- Second pass: histogram each frame ---
+    accum_I = np.zeros((n_qxy, n_qz), dtype=float)
+    accum_N = np.zeros((n_qxy, n_qz), dtype=float)
+    frame_maps: list[np.ndarray] = []
+
+    for fi in range(n_frames):
+        theta_f = float(arc_angles[fi])
+        ai = alpha_arr[fi]
+        bsx = float(bsx_per_frame[fi]) if fi < len(bsx_per_frame) else 0.0
+
+        img_rot, _ = rotate_image_and_mask(images[fi], k=cal.rotation_k)
+
+        mask_rot = None
+        if mask_fn is not None:
+            try:
+                mask_rot = mask_fn(images[fi].shape, theta_f, bsx)
+            except Exception as exc:
+                warnings.warn(
+                    f"mask_fn failed for frame {fi}: {exc}", stacklevel=2,
+                )
+
+        if dezinger_threshold is not None:
+            dz = dezinger(
+                img_rot, kernel_size=dezinger_kernel,
+                threshold=dezinger_threshold,
+            )
+            mask_rot = (mask_rot & dz) if mask_rot is not None else dz
+
+        qx_s, qy_s, qz_s = lab_to_sample_frame(
+            qx_lab, qy_lab, qz_lab_arr, ai,
+        )
+        qxy = np.sign(qx_s) * np.sqrt(qx_s ** 2 + qy_s ** 2)
+
+        valid = np.isfinite(qxy) & np.isfinite(qz_s) & np.isfinite(img_rot)
+        if mask_rot is not None:
+            valid &= mask_rot
+
+        qxy_v = qxy[valid].ravel()
+        qz_v = qz_s[valid].ravel()
+        I_v = img_rot[valid].ravel()
+
+        I_hist, _, _ = np.histogram2d(
+            qxy_v, qz_v, bins=[qxy_edges, qz_edges], weights=I_v,
+        )
+        N_hist, _, _ = np.histogram2d(
+            qxy_v, qz_v, bins=[qxy_edges, qz_edges],
+        )
+        accum_I += I_hist
+        accum_N += N_hist
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            frame_maps.append(np.where(N_hist > 0, I_hist / N_hist, np.nan))
+
+    with np.errstate(invalid="ignore", divide="ignore"):
+        summed = np.where(accum_N > 0, accum_I / accum_N, np.nan)
+
+    return {
+        "qxy_grid": qxy_grid,
+        "qz_grid": qz_grid,
+        "frames": frame_maps,
+        "summed": summed,
+    }
+
+
+# ===================================================================
+# Grazing-incidence reduction entry point
+# ===================================================================
+
+def reduce_smi_gi(
+    uid: str,
+    tiled_uri: str = "https://tiled.nsls2.bnl.gov",
+    catalog: str = "smi/migration",
+    waxs_mask_path: str | Path | None = None,
+    n_qxy: int = 500,
+    n_qz: int = 500,
+    incident_angle_deg: float | None = None,
+    theta_offset: float = -0.5,
+    waxs_beam_col_per_arc_deg: float = 0.08,
+    beamstop_max_abs_arc_deg: float = 15.0,
+    dezinger_threshold: float | None = 30000.0,
+    dezinger_kernel: int = 5,
+    waxs_cal_overrides: dict[str, Any] | None = None,
+) -> GIReductionResult:
+    """Full grazing-incidence WAXS reduction pipeline.
+
+    Parameters
+    ----------
+    uid : str
+        Tiled run UID.
+    tiled_uri, catalog : str
+        Tiled connection parameters.
+    waxs_mask_path : str or Path or None
+        Path to the WAXS mask JSON.  ``None`` (the default) uses the
+        bundled SMI default mask shipped with PyHyperScattering
+        (``PyHyperScattering.smi_defaults.default_waxs_mask_path``).
+    n_qxy, n_qz : int
+        Output grid dimensions.
+    incident_angle_deg : float or None
+        Manual incident-angle override.  None = auto-detect from
+        sample_name or motor positions.
+    theta_offset : float
+        Added to ``stage_th + piezo_th`` when auto-detecting the
+        incident angle.
+    waxs_beam_col_per_arc_deg : float
+        Beam-centre drift per degree of waxs_arc.
+    beamstop_max_abs_arc_deg : float
+        Mask beamstop only for ``|arc| <= this``.
+    dezinger_threshold, dezinger_kernel
+        Hot-pixel rejection parameters.
+    waxs_cal_overrides : dict or None
+        Extra overrides for ``WAXSCalibration`` fields.
+
+    Returns
+    -------
+    GIReductionResult
+    """
+    import time as _time
+    from PyHyperScattering.SMISWAXSLoader import (
+        TiledSMISWAXSLoader,
+        resolve_waxs_geometry,
+    )
+
+    t0 = _time.perf_counter()
+
+    # --- Connect & get metadata ---
+    from tiled.client import from_uri
+    client = from_uri(tiled_uri)
+    run = client[catalog + "/" + uid]
+    start = run.metadata.get("start", {})
+    sample_name = start.get("sample_name", "")
+    n_frames = start.get("num_points", 1)
+    scan_motor = (start.get("motors") or ["unknown"])[0]
+
+    # --- Incident angle ---
+    alpha_i, ai_source = find_incident_angle(
+        run, n_frames,
+        manual_override=incident_angle_deg,
+        theta_offset=theta_offset,
+    )
+
+    # --- Scan motor values (for labelling) ---
+    scan_motor_values = alpha_i.copy()  # default: use alpha_i
+    try:
+        primary_ds = run["primary"]
+        if scan_motor in primary_ds:
+            scan_motor_values = np.asarray(
+                primary_ds[scan_motor].read(), dtype=float,
+            )
+    except Exception:
+        pass
+
+    # --- Load WAXS images ---
+    loader = TiledSMISWAXSLoader(tiled_uri=tiled_uri, catalog=catalog)
+    waxs_raw = loader.loadSingleImage(uid, detector="waxs")
+    if waxs_raw is None:
+        raise RuntimeError(f"No WAXS data in scan {uid}")
+    t_load = _time.perf_counter()
+
+    # --- Mask ---
+    from PyHyperScattering.smi_defaults import resolve_mask_path
+    waxs_mask_path = resolve_mask_path(waxs_mask_path, detector="waxs")
+    waxs_mask_fn = None
+    if waxs_mask_path is not None:
+        waxs_mask_fn = make_waxs_mask_callable(
+            waxs_mask_path,
+            beamstop_max_abs_arc_deg=beamstop_max_abs_arc_deg,
+        )
+
+    # --- WAXS calibration ---
+    cal_dict: dict[str, Any] = dict(_DEFAULT_CAL)
+    cal_dict["beam_col_per_arc_deg"] = waxs_beam_col_per_arc_deg
+    if waxs_cal_overrides:
+        cal_dict.update(waxs_cal_overrides)
+    waxs_cal = WAXSCalibration(**cal_dict)
+
+    # --- Integrate ---
+    t_int = _time.perf_counter()
+    gi_out = integrate_waxs_gi(
+        waxs_raw=waxs_raw,
+        mask_fn=waxs_mask_fn,
+        alpha_i_deg=alpha_i,
+        n_qxy=n_qxy,
+        n_qz=n_qz,
+        cal=waxs_cal,
+        dezinger_threshold=dezinger_threshold,
+        dezinger_kernel=dezinger_kernel,
+    )
+    t_done = _time.perf_counter()
+
+    return GIReductionResult(
+        uid=uid,
+        sample_name=sample_name,
+        scan_motor=scan_motor,
+        scan_motor_values=scan_motor_values,
+        alpha_i_deg=alpha_i,
+        alpha_i_source=ai_source,
+        qxy_grid=gi_out["qxy_grid"],
+        qz_grid=gi_out["qz_grid"],
+        frames=gi_out["frames"],
+        summed=gi_out["summed"],
+        timing={
+            "total": t_done - t0,
+            "tiled_load": t_load - t0,
+            "integrate": t_done - t_int,
+        },
+    )
 
 
 # ===================================================================
@@ -1140,9 +2045,10 @@ def reduce_smi_combined(
     saxs_distance_delta_mm: float | None = None,
     saxs_q_cutoff: float | None = None,
     saxs_agbh_ring_order: int = 5,
-    saxs_q_margin_fraction: float = 0.08,
-    dezinger_threshold: float | None = None,
+    saxs_q_margin_fraction: float = 0.01,
+    dezinger_threshold: float | None = 3000.0,
     dezinger_kernel: int = 5,
+    waxs_beam_col_per_arc_deg: float = 0.0,
 ) -> CombinedReductionResult:
     """
     Full SAXS + WAXS reduction pipeline.
@@ -1158,7 +2064,10 @@ def reduce_smi_combined(
     solid_angle_correction : bool
         Apply solid-angle correction to intensities.
     saxs_mask_path, waxs_mask_path : str or Path, optional
-        JSON mask specification files.
+        JSON mask specification files. ``None`` (the default) uses the
+        bundled SMI default masks shipped with PyHyperScattering
+        (see ``PyHyperScattering.smi_defaults``). Pass an explicit path
+        to override.
     saxs_kwargs, waxs_kwargs : dict, optional
         Extra options passed to SAXS / WAXS integrators.
     backend_options : dict, optional
@@ -1212,9 +2121,7 @@ def reduce_smi_combined(
     # Load raw data
     from tiled.client import from_uri
 
-    cat = from_uri(tiled_uri)
-    for part in catalog.split("/"):
-        cat = cat[part]
+    cat = from_uri(tiled_uri)[catalog]
     run = cat[uid]
 
     primary = run["primary"].read()
@@ -1223,129 +2130,172 @@ def reduce_smi_combined(
     loader = TiledSMISWAXSLoader(tiled_uri=tiled_uri, catalog=catalog)
     saxs_raw = loader.loadSingleImage(uid, detector="saxs")
     waxs_raw = loader.loadSingleImage(uid, detector="waxs")
+    has_saxs = saxs_raw is not None
+    has_waxs = waxs_raw is not None
     t_load = _time.perf_counter()
 
-    # Resolve geometry with delta corrections applied
-    _saxs_geo_kw: dict[str, Any] = {}
-    if saxs_beam_delta_px is not None:
-        _saxs_geo_kw["beam_delta_row_px"] = saxs_beam_delta_px[0]
-        _saxs_geo_kw["beam_delta_col_px"] = saxs_beam_delta_px[1]
-    if saxs_distance_delta_mm is not None:
-        _saxs_geo_kw["distance_delta_mm"] = saxs_distance_delta_mm
-    saxs_geo = resolve_saxs_geometry(run, **_saxs_geo_kw)
+    # -- SAXS branch --
+    saxs_result: dict[str, Any] | None = None
+    saxs_geo = None
+    t_saxs_start = t_saxs_end = _time.perf_counter()
+    if has_saxs:
+        _saxs_geo_kw: dict[str, Any] = {}
+        if saxs_beam_delta_px is not None:
+            _saxs_geo_kw["beam_delta_row_px"] = saxs_beam_delta_px[0]
+            _saxs_geo_kw["beam_delta_col_px"] = saxs_beam_delta_px[1]
+        if saxs_distance_delta_mm is not None:
+            _saxs_geo_kw["distance_delta_mm"] = saxs_distance_delta_mm
+        saxs_geo = resolve_saxs_geometry(run, **_saxs_geo_kw)
 
-    _waxs_geo_kw: dict[str, Any] = {}
-    if waxs_beam_delta_px is not None:
-        _waxs_geo_kw["beam_delta_row_px"] = waxs_beam_delta_px[0]
-        _waxs_geo_kw["beam_delta_col_px"] = waxs_beam_delta_px[1]
-    waxs_geo = resolve_waxs_geometry(run, **_waxs_geo_kw)
+        # Update saxs_raw attrs with corrected geometry
+        _pixel1 = float(saxs_raw.attrs["pixel1"])
+        _pixel2 = float(saxs_raw.attrs["pixel2"])
+        new_attrs = dict(saxs_raw.attrs)
+        new_attrs["poni1"] = saxs_geo.beam_center_row_px * _pixel1
+        new_attrs["poni2"] = saxs_geo.beam_center_col_px * _pixel2
+        new_attrs["dist"] = saxs_geo.dist_m
+        saxs_raw.attrs.update(new_attrs)
 
-    # Update saxs_raw attrs with corrected geometry
-    _pixel1 = float(saxs_raw.attrs["pixel1"])
-    _pixel2 = float(saxs_raw.attrs["pixel2"])
-    new_attrs = dict(saxs_raw.attrs)
-    new_attrs["poni1"] = saxs_geo.beam_center_row_px * _pixel1
-    new_attrs["poni2"] = saxs_geo.beam_center_col_px * _pixel2
-    new_attrs["dist"] = saxs_geo.dist_m
-    saxs_raw.attrs.update(new_attrs)
-
-    # SAXS mask
-    if saxs_mask_path is None:
-        saxs_mask_path = saxs_kw.pop("mask_path", None)
-    saxs_mask = None
-    if saxs_mask_path is not None:
-        saxs_mask = make_saxs_mask_from_spec(
-            image_shape=saxs_raw.shape[-2:],
-            mask_path=saxs_mask_path,
-            active_beamstop=saxs_geo.active_beamstop,
-            beamstop_pos_mm=saxs_geo.beamstop_pos_mm,
-        )
-
-    # WAXS mask callable
-    waxs_mask_fn = None
-    if waxs_mask_path is None:
-        waxs_mask_path = waxs_kw.pop("mask_path", None)
-    if waxs_mask_path is not None:
-        waxs_bsx_pf = np.asarray(
-            waxs_raw.attrs.get("smi_waxs_bsx_per_frame", []),
-            dtype=float,
-        )
-        waxs_bsx_ref = float(
-            waxs_kw.pop(
-                "waxs_bsx_ref",
-                waxs_bsx_pf[0] if waxs_bsx_pf.size else 0.0,
+        # SAXS mask
+        if saxs_mask_path is None:
+            saxs_mask_path = saxs_kw.pop("mask_path", None)
+        from PyHyperScattering.smi_defaults import resolve_mask_path
+        saxs_mask_path = resolve_mask_path(saxs_mask_path, detector="saxs")
+        saxs_mask = None
+        if saxs_mask_path is not None:
+            saxs_mask = make_saxs_mask_from_spec(
+                image_shape=saxs_raw.shape[-2:],
+                mask_path=saxs_mask_path,
+                active_beamstop=saxs_geo.active_beamstop,
+                beamstop_pos_mm=saxs_geo.beamstop_pos_mm,
             )
+
+        # Integrate SAXS
+        t_saxs_start = _time.perf_counter()
+        _dyn_kw = dict(saxs_kw.get("dynamic_saxs_kwargs") or {})
+        _ap = dict(_dyn_kw.pop("aperture", {}) or {})
+        _ap.setdefault("agbh_ring_order", saxs_agbh_ring_order)
+        _ap.setdefault("q_margin_fraction", saxs_q_margin_fraction)
+        if saxs_q_cutoff is not None:
+            _ap["q_cutoff"] = saxs_q_cutoff
+        _dyn_kw["aperture"] = _ap
+
+        saxs_result = integrate_saxs(
+            saxs_raw=saxs_raw,
+            mask=saxs_mask,
+            n_q=n_q,
+            n_chi=n_chi,
+            solid_angle_correction=solid_angle_correction,
+            rotate_cw_90=bool(opts.get("saxs_rotate_cw_90", False)),
+            beam_center_col_px=saxs_geo.beam_center_col_px,
+            dynamic_saxs_mask=bool(saxs_kw.get("dynamic_saxs_mask", False)),
+            dynamic_saxs_kwargs=_dyn_kw,
+            dezinger_threshold=dezinger_threshold,
+            dezinger_kernel=dezinger_kernel,
         )
-        waxs_mask_fn = make_waxs_mask_callable(
-            waxs_mask_path,
-            waxs_bsx_ref=waxs_bsx_ref,
-            beamstop_max_abs_arc_deg=waxs_kw.pop(
-                "beamstop_max_abs_arc_deg", 6.0
-            ),
+        t_saxs_end = _time.perf_counter()
+
+    # -- WAXS branch --
+    waxs_result: dict[str, Any] | None = None
+    t_waxs_start = t_waxs_end = _time.perf_counter()
+    if has_waxs:
+        _waxs_geo_kw: dict[str, Any] = {}
+        if waxs_beam_delta_px is not None:
+            _waxs_geo_kw["beam_delta_row_px"] = waxs_beam_delta_px[0]
+            _waxs_geo_kw["beam_delta_col_px"] = waxs_beam_delta_px[1]
+        waxs_geo = resolve_waxs_geometry(run, **_waxs_geo_kw)
+
+        # WAXS mask callable
+        waxs_mask_fn = None
+        if waxs_mask_path is None:
+            waxs_mask_path = waxs_kw.pop("mask_path", None)
+        from PyHyperScattering.smi_defaults import resolve_mask_path
+        waxs_mask_path = resolve_mask_path(waxs_mask_path, detector="waxs")
+        if waxs_mask_path is not None:
+            waxs_bsx_pf = np.asarray(
+                waxs_raw.attrs.get("smi_waxs_bsx_per_frame", []),
+                dtype=float,
+            )
+            # waxs_bsx_ref is the bsx position where the mask polygon was
+            # drawn (typically arc ≈ 0°).  If the scan started at a different
+            # arc angle the first-frame bsx will be offset and we must NOT
+            # use it as the reference.  Prefer an explicit value from
+            # waxs_kwargs; fall back to computing the arc-0 bsx from the
+            # known linear bsx-vs-arc relationship (~-4.4 mm/deg at SMI).
+            _BSX_PER_ARC_DEG = -4.39  # mm/deg, SMI mechanical linkage
+            if "waxs_bsx_ref" in waxs_kw:
+                waxs_bsx_ref = float(waxs_kw.pop("waxs_bsx_ref"))
+            elif waxs_bsx_pf.size >= 2:
+                arc_pf = np.asarray(
+                    waxs_raw.coords[waxs_raw.dims[0]].values, dtype=float
+                )
+                if arc_pf.shape[0] == waxs_bsx_pf.shape[0] and (arc_pf.max() - arc_pf.min()) > 0.5:
+                    # Arc was scanned — fit slope and extrapolate to arc=0
+                    slope = np.polyfit(arc_pf, waxs_bsx_pf, 1)[0]
+                    waxs_bsx_ref = float(waxs_bsx_pf[0] - slope * arc_pf[0])
+                else:
+                    # Fixed arc with multiple frames — use known slope
+                    arc_val = float(arc_pf[0])
+                    waxs_bsx_ref = float(
+                        waxs_bsx_pf[0] - _BSX_PER_ARC_DEG * arc_val
+                    )
+            elif waxs_bsx_pf.size == 1:
+                # Single-frame fixed arc — use known slope
+                arc_val = float(
+                    waxs_raw.coords[waxs_raw.dims[0]].values[0]
+                )
+                waxs_bsx_ref = float(
+                    waxs_bsx_pf[0] - _BSX_PER_ARC_DEG * arc_val
+                )
+            else:
+                waxs_bsx_ref = 0.0
+            waxs_mask_fn = make_waxs_mask_callable(
+                waxs_mask_path,
+                waxs_bsx_ref=waxs_bsx_ref,
+                beamstop_max_abs_arc_deg=waxs_kw.pop(
+                    "beamstop_max_abs_arc_deg", 15.0
+                ),
+            )
+
+        # Build WAXS calibration
+        cal_dict: dict[str, Any] = dict(_DEFAULT_CAL)
+        cal_dict["beam_center_row"] = waxs_geo.beam_center_row_px
+        cal_dict["beam_center_col"] = waxs_geo.beam_center_col_px
+        if waxs_beam_col_per_arc_deg != 0:
+            cal_dict["beam_col_per_arc_deg"] = waxs_beam_col_per_arc_deg
+        cal_override_keys = set(WAXSCalibration.__dataclass_fields__.keys())
+        for k in list(waxs_kw.keys()):
+            if k in cal_override_keys:
+                cal_dict[k] = waxs_kw.pop(k)
+        waxs_cal = WAXSCalibration(**cal_dict)
+
+        t_waxs_start = _time.perf_counter()
+        waxs_result = integrate_waxs(
+            waxs_raw=waxs_raw,
+            mask_fn=waxs_mask_fn,
+            n_q=n_q,
+            n_chi=n_chi,
+            cal=waxs_cal,
+            solid_angle_correction=solid_angle_correction,
+            flip_horizontal=bool(opts.get("waxs_flip_horizontal", False)),
+            qx_shift_nm=float(opts.get("waxs_qx_shift_nm", 0.0)),
+            qy_shift_nm=float(opts.get("waxs_qy_shift_nm", 0.0)),
+            dezinger_threshold=dezinger_threshold,
+            dezinger_kernel=dezinger_kernel,
         )
+        t_waxs_end = _time.perf_counter()
+
     t_mask = _time.perf_counter()
 
-    # Build WAXS calibration — use geometry-resolved beam center
-    cal_dict: dict[str, Any] = dict(_DEFAULT_CAL)
-    cal_dict["beam_center_row"] = waxs_geo.beam_center_row_px
-    cal_dict["beam_center_col"] = waxs_geo.beam_center_col_px
-    cal_override_keys = set(WAXSCalibration.__dataclass_fields__.keys())
-    for k in list(waxs_kw.keys()):
-        if k in cal_override_keys:
-            cal_dict[k] = waxs_kw.pop(k)
-    waxs_cal = WAXSCalibration(**cal_dict)
-
-    # Integrate SAXS
-    t_saxs_start = _time.perf_counter()
-    # Merge user-supplied aperture overrides with top-level q-cutoff params
-    _dyn_kw = dict(saxs_kw.get("dynamic_saxs_kwargs") or {})
-    _ap = dict(_dyn_kw.pop("aperture", {}) or {})
-    _ap.setdefault("agbh_ring_order", saxs_agbh_ring_order)
-    _ap.setdefault("q_margin_fraction", saxs_q_margin_fraction)
-    if saxs_q_cutoff is not None:
-        _ap["q_cutoff"] = saxs_q_cutoff
-    _dyn_kw["aperture"] = _ap
-
-    saxs_result = integrate_saxs(
-        saxs_raw=saxs_raw,
-        mask=saxs_mask,
-        n_q=n_q,
-        n_chi=n_chi,
-        solid_angle_correction=solid_angle_correction,
-        rotate_cw_90=bool(opts.get("saxs_rotate_cw_90", False)),
-        beam_center_col_px=saxs_geo.beam_center_col_px,
-        dynamic_saxs_mask=bool(saxs_kw.get("dynamic_saxs_mask", False)),
-        dynamic_saxs_kwargs=_dyn_kw,
-        dezinger_threshold=dezinger_threshold,
-        dezinger_kernel=dezinger_kernel,
-    )
-    t_saxs_end = _time.perf_counter()
-
-    # Integrate WAXS
-    t_waxs_start = _time.perf_counter()
-    waxs_result = integrate_waxs(
-        waxs_raw=waxs_raw,
-        mask_fn=waxs_mask_fn,
-        n_q=n_q,
-        n_chi=n_chi,
-        cal=waxs_cal,
-        solid_angle_correction=solid_angle_correction,
-        flip_horizontal=bool(opts.get("waxs_flip_horizontal", False)),
-        qx_shift_nm=float(opts.get("waxs_qx_shift_nm", 0.0)),
-        qy_shift_nm=float(opts.get("waxs_qy_shift_nm", 0.0)),
-        dezinger_threshold=dezinger_threshold,
-        dezinger_kernel=dezinger_kernel,
-    )
-    t_waxs_end = _time.perf_counter()
-
-    # Merge
+    # Merge (handles None gracefully)
     t_merge_start = _time.perf_counter()
-    merged_qchi = merge_q_chi_weighted(
-        saxs_result["q_chi"], waxs_result["q_chi"], n_q=n_q, n_chi=n_chi
-    )
-    merged_iq = merge_iq_profiles(
-        merged_qchi, saxs_result["iq"], waxs_result["iq"]
-    )
+    saxs_qchi = saxs_result["q_chi"] if saxs_result else None
+    waxs_qchi = waxs_result["q_chi"] if waxs_result else None
+    saxs_iq = saxs_result["iq"] if saxs_result else None
+    waxs_iq = waxs_result["iq"] if waxs_result else None
+
+    merged_qchi = merge_q_chi_weighted(saxs_qchi, waxs_qchi, n_q=n_q, n_chi=n_chi)
+    merged_iq = merge_iq_profiles(merged_qchi, saxs_iq, waxs_iq)
     t_merge_end = _time.perf_counter()
 
     timing = {

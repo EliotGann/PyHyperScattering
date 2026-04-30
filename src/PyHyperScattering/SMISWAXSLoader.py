@@ -330,23 +330,147 @@ def resolve_waxs_geometry(
 # Image loading from Tiled
 # ---------------------------------------------------------------------------
 
-def _read_primary_field(run: Any, field: str) -> np.ndarray:
-    primary = run["primary"].read()
-    if field not in primary:
+def _get_primary_field_node(run: Any, field: str) -> Any:
+    """Return the tiled ArrayClient (or xarray-like) node for a primary field.
+
+    Avoids calling ``run["primary"].read()`` which would pull every variable
+    in the primary stream over the network.  Tries the common bluesky/tiled
+    layouts (``primary/data/<field>`` then ``primary/<field>``).
+    """
+    primary = run["primary"]
+    # Modern bluesky-tiled layout: primary -> data -> <field>
+    try:
+        data_node = primary["data"]
+    except Exception:
+        data_node = None
+    if data_node is not None:
+        try:
+            return data_node[field]
+        except Exception:
+            pass
+    # Fallback: field hangs directly off primary
+    try:
+        return primary[field]
+    except Exception as exc:  # pragma: no cover - defensive
         raise KeyError(
-            f"Field '{field}' not found in primary stream. "
-            f"Available: {list(primary.data_vars)}"
-        )
-    return np.asarray(primary[field].values)
+            f"Field '{field}' not found in primary stream of run."
+        ) from exc
+
+
+def _read_array_chunked(node: Any) -> np.ndarray:
+    """Read a tiled array node frame-by-frame to avoid server-side 500s.
+
+    The tiled server can return HTTP 500 when asked for a large multi-frame
+    detector image in a single request.  Reading one frame at a time keeps
+    each request small and works around the issue.  Falls back to a single
+    ``read()`` for nodes that do not support indexed access.
+    """
+    # Determine the leading dimension length
+    shape = getattr(node, "shape", None)
+    if shape is None or len(shape) == 0:
+        return np.asarray(node.read())
+
+    n = int(shape[0])
+    frames: list[np.ndarray] = []
+    for i in range(n):
+        # ArrayClient supports __getitem__ slicing → returns numpy array
+        try:
+            frame = np.asarray(node[i : i + 1])
+        except Exception:
+            # Some clients return scalars / different protocols
+            frame = np.asarray(node.read(slice=(slice(i, i + 1),)))
+        frames.append(frame)
+    if not frames:
+        return np.asarray(node.read())
+    return np.concatenate(frames, axis=0)
+
+
+def _read_primary_field(run: Any, field: str) -> np.ndarray:
+    """Read a single primary-stream field as a numpy array.
+
+    Attempts a single bulk read first; on HTTP/server errors falls back to
+    a frame-by-frame chunked read so that large detector arrays still load
+    successfully when the tiled backend rejects an "all at once" request.
+    """
+    node = _get_primary_field_node(run, field)
+
+    arr: np.ndarray
+    try:
+        # Tiled ArrayClient — supports .read() returning a numpy array
+        if hasattr(node, "read"):
+            raw = node.read()
+        else:
+            raw = node[...]
+        arr = np.asarray(raw)
+    except Exception as exc:
+        # Server-side failure (commonly HTTP 500 from tiled when the
+        # requested array exceeds an internal size threshold).  Retry by
+        # streaming one frame at a time.
+        try:
+            from httpx import HTTPStatusError
+            recoverable = isinstance(exc, HTTPStatusError) or "500" in str(exc)
+        except ImportError:  # pragma: no cover
+            recoverable = "500" in str(exc)
+        if not recoverable:
+            raise
+        arr = _read_array_chunked(node)
+
+    # Tiled may return 4-D: (primary_step, exposures, row, col).
+    # Average over the exposures axis to get (step, row, col).
+    if arr.ndim == 4:
+        arr = np.nanmean(arr, axis=1)
+    return arr
+
+
+def _has_primary_field(run: Any, field: str) -> bool:
+    """Return True if the given field exists in the primary stream.
+
+    Uses tiled container introspection to avoid downloading the entire
+    primary stream just to check for a field's presence.
+    """
+    try:
+        primary = run["primary"]
+    except Exception:
+        return False
+    # Try modern bluesky-tiled layout first: primary/data/<field>
+    try:
+        data_node = primary["data"]
+        if field in list(data_node):
+            return True
+    except Exception:
+        pass
+    # Fallback: field directly under primary
+    try:
+        return field in list(primary)
+    except Exception:
+        pass
+    # Last-resort: full read (slow but correct)
+    try:
+        ds = primary.read()
+        return field in ds
+    except Exception:
+        return False
 
 
 def _read_scan_axis(run: Any, field: str) -> np.ndarray | None:
-    try:
-        primary = run["primary"].read()
-        if field in primary:
-            return np.asarray(primary[field].values, dtype=float)
-    except Exception:
-        pass
+    """Read a motor field from primary; fall back to baseline if absent.
+
+    Reads only the requested field directly from tiled (avoids pulling the
+    full primary stream, which contains the multi-GB detector arrays).
+    """
+    if _has_primary_field(run, field):
+        try:
+            node = _get_primary_field_node(run, field)
+            values = node.read() if hasattr(node, "read") else node[...]
+            return np.asarray(values, dtype=float)
+        except Exception:
+            pass
+    # Fallback: read from baseline (start-of-scan snapshot).
+    # Baseline shape is (2,) — [start, end]; take the first value.
+    baseline = _read_baseline(run)
+    val = _dataset_scalar(baseline, field)
+    if val is not None:
+        return np.array([float(val)], dtype=float)
     return None
 
 
@@ -401,6 +525,11 @@ def load_saxs_raw(
     if images.ndim == 2:
         return xr.DataArray(images, dims=["pix_y", "pix_x"], attrs=attrs)
 
+    if images.ndim != 3:
+        raise ValueError(
+            f"Expected 2-D or 3-D SAXS image array, got {images.ndim}-D "
+            f"with shape {images.shape}"
+        )
     n_frames = images.shape[0]
     arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD)
     if arc_angles is not None and arc_angles.shape[0] == n_frames:
@@ -445,12 +574,25 @@ def load_waxs_raw(
 
     if images.ndim == 2:
         images = images[np.newaxis, :, :]
+    if images.ndim != 3:
+        raise ValueError(
+            f"Expected 2-D or 3-D WAXS image array, got {images.ndim}-D "
+            f"with shape {images.shape}"
+        )
     n_frames = images.shape[0]
 
-    if arc_angles is None or arc_angles.shape[0] != n_frames:
+    if arc_angles is None:
+        arc_angles = np.zeros(n_frames, dtype=float)
+    elif arc_angles.shape[0] == 1 and n_frames > 1:
+        arc_angles = np.full(n_frames, arc_angles[0], dtype=float)
+    elif arc_angles.shape[0] != n_frames:
         arc_angles = np.zeros(n_frames, dtype=float)
 
-    if bsx_values is None or bsx_values.shape[0] != n_frames:
+    if bsx_values is None:
+        bsx_values = np.zeros(n_frames, dtype=float)
+    elif bsx_values.shape[0] == 1 and n_frames > 1:
+        bsx_values = np.full(n_frames, bsx_values[0], dtype=float)
+    elif bsx_values.shape[0] != n_frames:
         bsx_values = np.zeros(n_frames, dtype=float)
 
     panels_attr = [
@@ -607,10 +749,8 @@ class TiledSMISWAXSLoader:
     def _get_catalog(self) -> Any:
         if self._catalog_client is None:
             from tiled.client import from_uri
-            cat = from_uri(self.tiled_uri)
-            for part in self.catalog.split("/"):
-                cat = cat[part]
-            self._catalog_client = cat
+            # Single path lookup — one HTTP round-trip
+            self._catalog_client = from_uri(self.tiled_uri)[self.catalog]
         return self._catalog_client
 
     def _get_run(self, uid: str) -> Any:
@@ -643,7 +783,7 @@ class TiledSMISWAXSLoader:
         detector: str = "saxs",
         geo_overrides: dict[str, Any] | None = None,
         extra_attrs: dict[str, Any] | None = None,
-    ) -> xr.DataArray:
+    ) -> xr.DataArray | None:
         """
         Load raw images for one run.
 
@@ -660,7 +800,8 @@ class TiledSMISWAXSLoader:
 
         Returns
         -------
-        xr.DataArray
+        xr.DataArray or None
+            None if the requested detector is not present in the run.
             SAXS: dims (pix_y, pix_x) or (frame, pix_y, pix_x)
             WAXS: dims (waxs_arc, pix_y, pix_x)
         """
@@ -668,12 +809,16 @@ class TiledSMISWAXSLoader:
         overrides = dict(geo_overrides or {})
 
         if detector == "saxs":
+            if not _has_primary_field(run, SAXS_IMAGE_FIELD):
+                return None
             geo = resolve_saxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
             return load_saxs_raw(run, geo, extra_attrs=extra_attrs)
 
         if detector == "waxs":
+            if not _has_primary_field(run, WAXS_IMAGE_FIELD):
+                return None
             geo = resolve_waxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
@@ -703,4 +848,211 @@ class TiledSMISWAXSLoader:
             "waxs": self.loadSingleImage(
                 uid, "waxs", geo_overrides=geo_overrides, extra_attrs=extra_attrs,
             ),
+        }
+
+    # ------------------------------------------------------------------
+    # Tiled catalog browsing convenience
+    # ------------------------------------------------------------------
+
+    def searchCatalog(
+        self,
+        sample: str | None = None,
+        plan: str | None = None,
+        scan_id: int | None = None,
+        cycle: str | None = None,
+        proposal: str | None = None,
+        user: str | None = None,
+        institution: str | None = None,
+        detector: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int | None = None,
+        outputType: str = "default",
+        **kwargs: Any,
+    ):
+        """Search the SMI Tiled catalog and return a results table.
+
+        Modeled on :meth:`SST1RSoXSDB.searchCatalog` so that browsers and
+        notebooks have a consistent API across NSLS-II beamlines.  Each
+        keyword argument is mapped to a databroker query against the
+        run-start metadata; only the keywords with a non-``None`` value
+        contribute to the search.
+
+        Parameters
+        ----------
+        sample, plan, user, institution, cycle : str | None
+            Case-insensitive substring (regex) matches against the
+            corresponding ``start`` keys.
+        scan_id, proposal : int | None
+            Exact numeric matches.
+        detector : {'saxs', 'waxs'} | None
+            If given, restrict to runs whose ``start.detectors`` field
+            contains the SMI image-field substring for that detector
+            (``"pil2M"`` or ``"pil900KW"``).
+        since, until : str | None
+            ISO-8601 timestamps, forwarded to
+            :meth:`tiled.client.Catalog.search` via the
+            ``TimeRange`` query.
+        limit : int | None
+            Cap the number of result rows returned (avoids pulling
+            thousands of metadata blobs over the network).
+        outputType : {'default', 'scans', 'all'}
+            ``'scans'`` returns a 1-column DataFrame of scan IDs;
+            ``'default'`` returns the columns
+            ``[scan_id, start_time, sample_name, plan_name, detectors,
+            num_points, uid]``; ``'all'`` adds ``cycle, user_name,
+            institution, proposal_id``.
+        **kwargs
+            Additional ``key=value`` pairs forwarded as
+            case-insensitive regex matches against ``start[key]``.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Empty DataFrame if no results.
+
+        Notes
+        -----
+        Requires ``tiled`` to be installed.  All network access is lazy:
+        the catalog is not contacted until this method is called.
+        """
+        import pandas as pd
+
+        cat = self._get_catalog()
+
+        try:
+            from tiled.queries import Key, Regex, TimeRange  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional dep
+            raise ImportError(
+                "searchCatalog requires `tiled.queries` (install `tiled[client]`)."
+            ) from exc
+
+        def _regex_search(node, field: str, value: str):
+            return node.search(Regex(field, f"(?i){value}"))
+
+        def _detector_substring(d: str) -> str:
+            d = d.lower()
+            if d == "saxs":
+                return "pil2M"
+            if d == "waxs":
+                return "pil900KW"
+            raise ValueError(f"detector must be 'saxs' or 'waxs', got {d!r}")
+
+        node = cat
+        if sample is not None:
+            node = _regex_search(node, "sample_name", str(sample))
+        if plan is not None:
+            node = _regex_search(node, "plan_name", str(plan))
+        if user is not None:
+            node = _regex_search(node, "user_name", str(user))
+        if institution is not None:
+            node = _regex_search(node, "institution", str(institution))
+        if cycle is not None:
+            node = _regex_search(node, "cycle", str(cycle))
+        if scan_id is not None:
+            node = node.search(Key("scan_id") == int(scan_id))
+        if proposal is not None:
+            node = node.search(Key("proposal_id") == int(proposal))
+        if detector is not None:
+            node = _regex_search(node, "detectors", _detector_substring(detector))
+        if since is not None or until is not None:
+            node = node.search(TimeRange(since=since, until=until))
+        for key, value in kwargs.items():
+            if value is None:
+                continue
+            if isinstance(value, (int, float)):
+                node = node.search(Key(key) == value)
+            else:
+                node = _regex_search(node, key, str(value))
+
+        rows: list[dict[str, Any]] = []
+        for i, (uid, run) in enumerate(node.items()):
+            if limit is not None and i >= int(limit):
+                break
+            try:
+                start = dict(run.metadata.get("start", {}))
+            except Exception:
+                start = {}
+            try:
+                stop = dict(run.metadata.get("stop", {}) or {})
+            except Exception:
+                stop = {}
+            num_points = None
+            try:
+                num_points = stop.get("num_events", {}).get("primary")
+            except Exception:
+                pass
+            row = {
+                "scan_id": start.get("scan_id"),
+                "start_time": start.get("time"),
+                "sample_name": start.get("sample_name"),
+                "plan_name": start.get("plan_name"),
+                "detectors": start.get("detectors"),
+                "num_points": num_points,
+                "uid": uid,
+            }
+            if outputType == "all":
+                row.update({
+                    "cycle": start.get("cycle"),
+                    "user_name": start.get("user_name"),
+                    "institution": start.get("institution"),
+                    "proposal_id": start.get("proposal_id"),
+                })
+            rows.append(row)
+
+        df = pd.DataFrame(rows)
+        if outputType == "scans" and not df.empty:
+            df = df[["scan_id"]].copy()
+        return df
+
+    def browseCatalog(self, **kwargs: Any):
+        """Interactive catalog browser (uses :class:`ipyaggrid.Grid`).
+
+        Thin wrapper around :meth:`searchCatalog`; same kwargs.  Returns
+        an ``ipyaggrid.Grid`` widget suitable for Jupyter / JupyterHub.
+        """
+        df = self.searchCatalog(**kwargs)
+        try:
+            from ipyaggrid import Grid  # type: ignore
+        except Exception as exc:  # pragma: no cover - optional dep
+            raise ImportError(
+                "browseCatalog requires `ipyaggrid` (pip install ipyaggrid)."
+            ) from exc
+        return Grid(
+            grid_data=df,
+            grid_options={
+                "columnDefs": [{"field": c} for c in df.columns],
+                "enableSorting": True,
+                "enableFilter": True,
+                "enableColResize": True,
+            },
+        )
+
+    def summarizeRun(self, uid: str) -> dict[str, Any]:
+        """Return a small dict of headline metadata for one uid.
+
+        Useful for "what is this scan?" lookups in browser tooltips
+        without paying for a full primary-stream read.
+        """
+        run = self._get_run(uid)
+        try:
+            start = dict(run.metadata.get("start", {}))
+        except Exception:
+            start = {}
+        detectors = start.get("detectors") or []
+        detector_kinds: list[str] = []
+        from PyHyperScattering.smi_defaults import classify_detector_field
+        for d in detectors:
+            kind = classify_detector_field(d)
+            if kind and kind not in detector_kinds:
+                detector_kinds.append(kind)
+        return {
+            "uid": uid,
+            "scan_id": start.get("scan_id"),
+            "sample_name": start.get("sample_name"),
+            "plan_name": start.get("plan_name"),
+            "detectors": detectors,
+            "detector_kinds": detector_kinds,
+            "start_time": start.get("time"),
+            "num_points": start.get("num_points"),
         }
