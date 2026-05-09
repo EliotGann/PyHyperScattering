@@ -132,16 +132,22 @@ def test_read_primary_field_uses_bulk_when_available():
     assert node.slice_calls == 0
 
 
-def test_read_primary_field_non_500_error_propagates():
+def test_read_primary_field_non_500_error_propagates(monkeypatch):
+    # Both bulk and per-frame reads fail — the chunked fallback should
+    # exhaust its retries and surface the underlying error.
+    monkeypatch.setattr(L, "_PER_FRAME_RETRIES", 1)
+
     class _BadNode(_FakeArrayNode):
-        def read(self):
+        def read(self, slice=None):
+            raise RuntimeError("permission denied")
+
+        def __getitem__(self, key):
             raise RuntimeError("permission denied")
 
     node = _BadNode(np.zeros((2, 3, 4)), fail_bulk=True)
     run = _FakeRun({L.SAXS_IMAGE_FIELD: node})
     with pytest.raises(RuntimeError, match="permission denied"):
         L._read_primary_field(run, L.SAXS_IMAGE_FIELD)
-
 
 def test_load_saxs_raw_via_chunked_fallback():
     """End-to-end: loadSingleImage path works when bulk read 500s."""

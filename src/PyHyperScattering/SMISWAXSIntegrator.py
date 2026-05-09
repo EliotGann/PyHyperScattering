@@ -44,6 +44,147 @@ from PyHyperScattering.SMISWAXSLoader import (
 
 
 # ===================================================================
+# Geometry cache – persists across calls within the same Python process
+# ===================================================================
+#
+# GUI integration
+# ---------------
+# The geometry cache stores precomputed per-pixel q-maps so that repeated
+# reductions with the same detector geometry (energy, distance, beam center,
+# panel offsets, masks, etc.) skip the expensive trigonometry.
+#
+# Usage from a GUI or batch script:
+#
+#     from PyHyperScattering.SMISWAXSIntegrator import (
+#         reduce_smi_combined,
+#         clear_geometry_cache,
+#         geometry_cache_info,
+#     )
+#
+#     # Process many scans — geometry is computed once, then reused:
+#     for uid in uid_list:
+#         result = reduce_smi_combined(uid, cache_geometry=True, ...)
+#
+#     # When the user changes calibration (beam center, distance, energy,
+#     # panel offsets, etc.), clear the stale cache:
+#     clear_geometry_cache()
+#
+#     # Or inspect current cache size:
+#     info = geometry_cache_info()
+#     print(f"Cache holds {info['waxs_entries']} WAXS geometries, "
+#           f"~{info['estimated_mb']:.1f} MB")
+#
+# The cache is keyed on the full set of geometry parameters, so if you
+# change *any* calibration value the old entry simply won't match and a
+# new one will be computed (no stale-data risk).  Call
+# ``clear_geometry_cache()`` only to free memory.
+
+_WAXS_GEOMETRY_CACHE: dict[tuple, dict[float, tuple]] = {}
+_SAXS_GEOMETRY_CACHE: dict[tuple, tuple] = {}
+
+
+def clear_geometry_cache() -> None:
+    """Clear the module-level geometry cache to free memory.
+
+    Call this when you want to reclaim memory in a long-running process
+    (e.g. a GUI).  It is *not* necessary to call this when calibration
+    parameters change — the cache is keyed on the full parameter set, so
+    a changed parameter simply produces a new cache entry.
+
+    Example (in a GUI callback when user clicks "Reset Calibration")::
+
+        from PyHyperScattering.SMISWAXSIntegrator import clear_geometry_cache
+        clear_geometry_cache()
+    """
+    _WAXS_GEOMETRY_CACHE.clear()
+    _SAXS_GEOMETRY_CACHE.clear()
+
+
+def geometry_cache_info() -> dict[str, Any]:
+    """Return a summary of the current geometry cache state.
+
+    Returns
+    -------
+    dict with keys:
+        waxs_entries : int – number of distinct WAXS calibration keys cached
+        waxs_angles_total : int – total number of cached arc-angle q-maps
+        saxs_entries : int – number of distinct SAXS geometry keys cached
+        estimated_mb : float – rough memory estimate in megabytes
+    """
+    waxs_angles = sum(len(v) for v in _WAXS_GEOMETRY_CACHE.values())
+    # Each cached angle holds ~5 arrays of shape (ny, nx); estimate 619×487
+    # ≈ 300k pixels × 8 bytes × 5 arrays ≈ 12 MB per angle
+    est_per_angle_mb = 12.0
+    # Each SAXS entry holds ~5 arrays of shape (ny, nx); estimate 1475×1679
+    # ≈ 2.5M pixels × 8 bytes × 5 ≈ 100 MB per entry
+    est_per_saxs_mb = 100.0
+    estimated_mb = (
+        waxs_angles * est_per_angle_mb
+        + len(_SAXS_GEOMETRY_CACHE) * est_per_saxs_mb
+    )
+    return {
+        "waxs_entries": len(_WAXS_GEOMETRY_CACHE),
+        "waxs_angles_total": waxs_angles,
+        "saxs_entries": len(_SAXS_GEOMETRY_CACHE),
+        "estimated_mb": estimated_mb,
+    }
+
+
+def _waxs_cache_key(
+    cal: "WAXSCalibration",
+    image_shape: tuple[int, int],
+    flip_horizontal: bool,
+    qx_shift_nm: float,
+    qy_shift_nm: float,
+) -> tuple:
+    """Build a hashable key from all parameters that affect WAXS q-maps."""
+    return (
+        cal.energy_kev,
+        cal.sample_distance_mm,
+        cal.pixel_size_mm,
+        cal.beam_center_row,
+        cal.beam_center_col,
+        tuple(cal.panel_col_ranges),
+        tuple(cal.panel_offsets_deg),
+        tuple(cal.panel_row_shifts),
+        tuple(cal.panel_col_shifts),
+        tuple(cal.panel_delta_deg),
+        cal.theta_zero_deg,
+        cal.sample_offset_x_mm,
+        cal.sample_offset_z_mm,
+        cal.beam_col_per_arc_deg,
+        cal.q_horizontal_sign,
+        cal.q_vertical_sign,
+        cal.rotation_k,
+        image_shape,
+        flip_horizontal,
+        round(qx_shift_nm, 10),
+        round(qy_shift_nm, 10),
+    )
+
+
+def _saxs_cache_key(
+    dist_m: float,
+    poni1_m: float,
+    poni2_m: float,
+    pixel1_m: float,
+    pixel2_m: float,
+    wavelength_m: float,
+    image_shape: tuple[int, int],
+) -> tuple:
+    """Build a hashable key from all parameters that affect SAXS q-maps."""
+    return (
+        round(dist_m, 12),
+        round(poni1_m, 12),
+        round(poni2_m, 12),
+        round(pixel1_m, 12),
+        round(pixel2_m, 12),
+        round(wavelength_m, 15),
+        image_shape,
+    )
+
+
+# ===================================================================
 # WAXS detector geometry – ported from waxs_reduce.py
 # ===================================================================
 
@@ -1650,6 +1791,7 @@ def integrate_saxs(
     dynamic_saxs_kwargs: dict[str, Any] | None = None,
     dezinger_threshold: float | None = None,
     dezinger_kernel: int = 5,
+    cache_geometry: bool = True,
 ) -> dict[str, Any]:
     """SAXS reduction via direct pixel-space q-map and histogram binning."""
     attrs = saxs_raw.attrs
@@ -1670,31 +1812,44 @@ def integrate_saxs(
 
     shape = images.shape[-2:]
     ny, nx = shape
-    rr, cc = np.meshgrid(
-        np.arange(ny, dtype=float),
-        np.arange(nx, dtype=float),
-        indexing="ij",
-    )
-    bc_row = poni1_m / pixel1_m
-    bc_col = poni2_m / pixel2_m
 
-    x_m = (cc - bc_col) * pixel2_m
-    y_m = -(rr - bc_row) * pixel1_m
-    r_m = np.sqrt(x_m**2 + y_m**2 + dist_m**2)
-    k = 2.0 * np.pi / wavelength_nm
+    # Check persistent geometry cache
+    _saxs_key = _saxs_cache_key(dist_m, poni1_m, poni2_m, pixel1_m, pixel2_m, wavelength_m, shape)
+    _cached = _SAXS_GEOMETRY_CACHE.get(_saxs_key) if cache_geometry else None
 
-    qh2d = k * x_m / r_m
-    qv2d = k * y_m / r_m
-    qz2d = k * (dist_m / r_m - 1.0)
-    q2d = np.sqrt(qh2d**2 + qv2d**2 + qz2d**2)
-    chi_deg_2d = np.rad2deg(np.arctan2(qh2d, qv2d))
+    if _cached is not None:
+        q2d, qh2d, qv2d, chi_deg_2d, sa_base = _cached
+        # Recompute sa based on current solid_angle_correction setting
+        sa = sa_base if solid_angle_correction else None
+    else:
+        rr, cc = np.meshgrid(
+            np.arange(ny, dtype=float),
+            np.arange(nx, dtype=float),
+            indexing="ij",
+        )
+        bc_row = poni1_m / pixel1_m
+        bc_col = poni2_m / pixel2_m
 
-    if solid_angle_correction:
+        x_m = (cc - bc_col) * pixel2_m
+        y_m = -(rr - bc_row) * pixel1_m
+        r_m = np.sqrt(x_m**2 + y_m**2 + dist_m**2)
+        k = 2.0 * np.pi / wavelength_nm
+
+        qh2d = k * x_m / r_m
+        qv2d = k * y_m / r_m
+        qz2d = k * (dist_m / r_m - 1.0)
+        q2d = np.sqrt(qh2d**2 + qv2d**2 + qz2d**2)
+        chi_deg_2d = np.rad2deg(np.arctan2(qh2d, qv2d))
+
         pixel_area_m2 = pixel1_m * pixel2_m
         with np.errstate(invalid="ignore", divide="ignore"):
-            sa = pixel_area_m2 * np.maximum(dist_m, 0.0) / (r_m**3)
-    else:
-        sa = None
+            sa_base = pixel_area_m2 * np.maximum(dist_m, 0.0) / (r_m**3)
+        sa = sa_base if solid_angle_correction else None
+
+        if cache_geometry:
+            _SAXS_GEOMETRY_CACHE[_saxs_key] = (q2d, qh2d, qv2d, chi_deg_2d, sa_base)
+
+    bc_col = poni2_m / pixel2_m
 
     base_valid = np.isfinite(q2d) & np.isfinite(chi_deg_2d)
     if mask_use is not None:
@@ -1842,6 +1997,7 @@ def integrate_waxs(
     qy_shift_nm: float = 0.0,
     dezinger_threshold: float | None = None,
     dezinger_kernel: int = 5,
+    cache_geometry: bool = True,
 ) -> dict[str, Any]:
     """WAXS reduction via MultiPanelArcDetector per arc-angle frame."""
     attrs = waxs_raw.attrs
@@ -1878,12 +2034,26 @@ def integrate_waxs(
 
     # Pre-compute global q/chi range across all angles
     _all_q_min, _all_q_max = [], []
-    _geo_cache: dict[float, tuple] = {}
+
+    # Use module-level persistent cache if requested
+    _cache_key = None
+    if cache_geometry:
+        _cache_key = _waxs_cache_key(cal, rot_shape, flip_horizontal, qx_shift_nm, qy_shift_nm)
+        _geo_cache = _WAXS_GEOMETRY_CACHE.setdefault(_cache_key, {})
+    else:
+        _geo_cache = {}
 
     for theta_val in arc_angles:
         theta_f = float(theta_val)
         key = round(theta_f, 6)
         if key in _geo_cache:
+            # Still need q-range info even from cached entries
+            qabs_px = _geo_cache[key][0]
+            chi_px = _geo_cache[key][3]
+            finite = np.isfinite(qabs_px) & np.isfinite(chi_px)
+            if finite.any():
+                _all_q_min.append(float(np.nanmin(qabs_px[finite])))
+                _all_q_max.append(float(np.nanmax(qabs_px[finite])))
             continue
         det = build_detector_for_angle(theta_f)
         qds = det.qmap(theta_f)
@@ -2049,6 +2219,7 @@ def reduce_smi_combined(
     dezinger_threshold: float | None = 3000.0,
     dezinger_kernel: int = 5,
     waxs_beam_col_per_arc_deg: float = 0.0,
+    cache_geometry: bool = True,
 ) -> CombinedReductionResult:
     """
     Full SAXS + WAXS reduction pipeline.
@@ -2100,6 +2271,12 @@ def reduce_smi_combined(
         both SAXS and WAXS per frame. None (default) disables dezingering.
     dezinger_kernel : int
         Kernel size for the dezinger median filter (default 5).
+    cache_geometry : bool
+        If True (default), cache precomputed q-maps in a module-level dict
+        so that subsequent calls with the same geometry parameters skip the
+        expensive pixel-position trigonometry.  Safe across scans that share
+        calibration.  Call :func:`clear_geometry_cache` to free memory or
+        after programmatically changing calibration parameters.
 
     Returns
     -------
@@ -2124,8 +2301,11 @@ def reduce_smi_combined(
     cat = from_uri(tiled_uri)[catalog]
     run = cat[uid]
 
-    primary = run["primary"].read()
-    scan_info = infer_detectors_and_steps(run, primary)
+    # Avoid run["primary"].read() — that pulls every variable in the primary
+    # stream including the multi-frame detector arrays, which can trigger
+    # an HTTP 500 from the tiled backend.  infer_detectors_and_steps now
+    # introspects the tiled containers directly.
+    scan_info = infer_detectors_and_steps(run, None)
 
     loader = TiledSMISWAXSLoader(tiled_uri=tiled_uri, catalog=catalog)
     saxs_raw = loader.loadSingleImage(uid, detector="saxs")
@@ -2192,6 +2372,7 @@ def reduce_smi_combined(
             dynamic_saxs_kwargs=_dyn_kw,
             dezinger_threshold=dezinger_threshold,
             dezinger_kernel=dezinger_kernel,
+            cache_geometry=cache_geometry,
         )
         t_saxs_end = _time.perf_counter()
 
@@ -2282,6 +2463,7 @@ def reduce_smi_combined(
             qy_shift_nm=float(opts.get("waxs_qy_shift_nm", 0.0)),
             dezinger_threshold=dezinger_threshold,
             dezinger_kernel=dezinger_kernel,
+            cache_geometry=cache_geometry,
         )
         t_waxs_end = _time.perf_counter()
 

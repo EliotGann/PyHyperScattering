@@ -20,8 +20,11 @@ Design principles
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
+
+import time
 
 import numpy as np
 import xarray as xr
@@ -79,10 +82,52 @@ def _as_scalar(value: Any) -> Any:
 
 
 def _read_baseline(run: Any) -> xr.Dataset | None:
+    """Read the baseline stream as an xr.Dataset (legacy path).
+
+    Falls back to the new bluesky-tiled-plugins layout where baseline is
+    accessed via ``run["baseline"]["internal"]`` (a DataFrameClient) rather
+    than ``run["baseline"].read()`` (which raises KeyError('data')).
+    """
     try:
         return run["baseline"].read()
     except (KeyError, Exception):
-        return None
+        pass
+    # New layout: baseline["internal"] is a DataFrameClient (pandas-like).
+    # Convert to xr.Dataset so existing _dataset_scalar() calls still work.
+    try:
+        internal = run["baseline"]["internal"]
+        df = internal.read() if hasattr(internal, "read") else None
+        if df is not None:
+            import pandas as pd
+            if isinstance(df, pd.DataFrame):
+                return xr.Dataset.from_dataframe(df)
+            # May already be an xr.Dataset
+            if isinstance(df, xr.Dataset):
+                return df
+    except Exception:
+        pass
+    return None
+
+
+def _baseline_scalar(run: Any, key: str) -> Any:
+    """Read a single scalar from the baseline stream (first value).
+
+    Tries the efficient per-column access path on the new tiled layout
+    first (avoids pulling all 564 columns), then falls back to reading the
+    full baseline as xr.Dataset.
+    """
+    # Fast path: baseline/internal DataFrameClient with per-column access
+    try:
+        internal = run["baseline"]["internal"]
+        columns = list(internal)
+        if key in columns:
+            vals = internal[key].read() if hasattr(internal[key], "read") else internal[key][...]
+            return _as_scalar(np.asarray(vals))
+    except Exception:
+        pass
+    # Fallback: full baseline read (old layout or xr.Dataset path)
+    baseline = _read_baseline(run)
+    return _dataset_scalar(baseline, key)
 
 
 def _dataset_scalar(ds: xr.Dataset | None, key: str) -> Any:
@@ -107,8 +152,78 @@ def _primary_conf(run: Any, det_key: str) -> dict:
         return {}
 
 
+def _primary_scalar(run: Any, field: str) -> Any:
+    """Read a scalar motor/signal value from the primary stream.
+
+    Only returns a value if the field exists in primary AND has a single
+    unique value (i.e., it's a "read" companion, not the varying scan axis).
+    For varying scan axes, use _read_scan_axis() instead.
+    """
+    if not _has_primary_field(run, field):
+        return None
+    try:
+        node = _get_primary_field_node(run, field)
+        values = node.read() if hasattr(node, "read") else node[...]
+        arr = np.asarray(values, dtype=float)
+        # If all values are the same, treat as a scalar
+        if arr.size > 0 and np.all(arr == arr[0]):
+            return float(arr[0])
+        # If values vary, return the first (start-of-scan position)
+        if arr.size > 0:
+            return float(arr[0])
+    except Exception:
+        pass
+    return None
+
+
 def _energy_to_wavelength_m(energy_ev: float) -> float:
     return _HBAR_C_EV_M / float(energy_ev)
+
+
+# ---------------------------------------------------------------------------
+# Sample name parsing
+# ---------------------------------------------------------------------------
+
+def parse_sample_name_geometry(sample_name: str) -> dict[str, float]:
+    """Extract geometry parameters encoded in the sample_name string.
+
+    Common SMI naming conventions:
+      _wa{X}_   → WAXS arc angle (degrees)
+      _sdd{X}m  → sample-detector distance (metres)
+      _{X}keV   → photon energy (keV)
+      _ai{X}_   → incident angle (degrees)
+      _th{X}_   → sample theta (degrees)
+
+    Returns a dict with only the keys that were successfully parsed.
+    """
+    result: dict[str, float] = {}
+
+    # WAXS arc angle: _wa20.0_ or _wa20.0 (at end)
+    m = re.search(r"_wa([\d.]+)", sample_name)
+    if m:
+        result["waxs_arc_deg"] = float(m.group(1))
+
+    # Sample-detector distance: _sdd2.0m or _sdd2.0m_ (value in metres)
+    m = re.search(r"_sdd([\d.]+)m?", sample_name)
+    if m:
+        result["sdd_m"] = float(m.group(1))
+
+    # Photon energy: _16.10keV_
+    m = re.search(r"_([\d.]+)keV", sample_name)
+    if m:
+        result["energy_kev"] = float(m.group(1))
+
+    # Incident angle: _ai0.12_
+    m = re.search(r"_ai([\d.]+)", sample_name)
+    if m:
+        result["incident_angle_deg"] = float(m.group(1))
+
+    # Sample theta: _th0.5_
+    m = re.search(r"_th([\d.]+)", sample_name)
+    if m:
+        result["theta_deg"] = float(m.group(1))
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -169,35 +284,69 @@ def resolve_saxs_geometry(
     energy_kev: float | None = None,
     **overrides: Any,
 ) -> SAXSGeometry:
-    """Resolve full SAXS geometry from a tiled run."""
+    """Resolve full SAXS geometry from a tiled run.
+
+    Fallback order for each parameter:
+      1. User override (``overrides`` dict)
+      2. Primary stream (per-frame value, if field present)
+      3. Baseline stream (start-of-scan snapshot — always present)
+      4. Primary configuration metadata
+      5. Start metadata / sample_name encoding
+      6. Hardcoded instrument defaults
+    """
     baseline = _read_baseline(run)
     conf = _primary_conf(run, "pil2M")
     start = run.metadata.get("start", {})
+    sample_name = start.get("sample_name", "")
+    name_geo = parse_sample_name_geometry(sample_name)
 
-    energy_kev = energy_kev or start.get("energy") or DEFAULT_ENERGY_KEV
+    # Energy resolution: override > start metadata > baseline > sample_name > default
+    if energy_kev is None:
+        _baseline_energy_ev = _baseline_scalar(run, "energy_energy")
+        _baseline_energy_kev = (
+            _baseline_energy_ev / 1000.0 if _baseline_energy_ev is not None else None
+        )
+        energy_kev = (
+            start.get("energy")
+            or _baseline_energy_kev
+            or name_geo.get("energy_kev")
+            or DEFAULT_ENERGY_KEV
+        )
     energy_ev = float(energy_kev) * 1000.0
 
+    # Beam center: override > baseline > primary conf > default
     beam_row = (
         overrides.get("beam_center_row_px")
+        or _baseline_scalar(run, "pil2M_beam_center_y_px")
         or _dataset_scalar(baseline, "pil2M_beam_center_y_px")
         or _conf_scalar(conf, "pil2M_beam_center_y_px")
         or _SAXS_DEFAULT_BEAM_ROW_PX
     )
     beam_col = (
         overrides.get("beam_center_col_px")
+        or _baseline_scalar(run, "pil2M_beam_center_x_px")
         or _dataset_scalar(baseline, "pil2M_beam_center_x_px")
         or _conf_scalar(conf, "pil2M_beam_center_x_px")
         or _SAXS_DEFAULT_BEAM_COL_PX
     )
+
+    # Distance: override > primary > baseline > sample_name > conf > default
+    _sdd_from_name = name_geo.get("sdd_m")
+    _sdd_from_name_mm = _sdd_from_name * 1000.0 if _sdd_from_name is not None else None
     dist_mm = (
         overrides.get("sample_distance_mm")
+        or _primary_scalar(run, "pil2M_motor_z")
+        or _baseline_scalar(run, "pil2M_motor_z_user_setpoint")
+        or _baseline_scalar(run, "pil2M_motor_z")
         or _dataset_scalar(baseline, "pil2M_motor_z_user_setpoint")
         or _dataset_scalar(baseline, "pil2M_motor_z")
         or _conf_scalar(conf, "pil2M_sdd_mm")
+        or _sdd_from_name_mm
         or _SAXS_DEFAULT_DISTANCE_MM
     )
     active_bs = (
         overrides.get("active_beamstop")
+        or _baseline_scalar(run, "pil2M_active_beamstop")
         or _dataset_scalar(baseline, "pil2M_active_beamstop")
         or _conf_scalar(conf, "pil2M_active_beamstop")
         or "rod"
@@ -206,21 +355,29 @@ def resolve_saxs_geometry(
     bs_pos = {
         "rod": {
             "x": (
-                _dataset_scalar(baseline, "saxs_beamstop_x_rod_user_setpoint")
+                _baseline_scalar(run, "saxs_beamstop_x_rod_user_setpoint")
+                or _dataset_scalar(baseline, "saxs_beamstop_x_rod_user_setpoint")
+                or _baseline_scalar(run, "saxs_beamstop_x_rod")
                 or _dataset_scalar(baseline, "saxs_beamstop_x_rod")
             ),
             "y": (
-                _dataset_scalar(baseline, "saxs_beamstop_y_rod_user_setpoint")
+                _baseline_scalar(run, "saxs_beamstop_y_rod_user_setpoint")
+                or _dataset_scalar(baseline, "saxs_beamstop_y_rod_user_setpoint")
+                or _baseline_scalar(run, "saxs_beamstop_y_rod")
                 or _dataset_scalar(baseline, "saxs_beamstop_y_rod")
             ),
         },
         "pin": {
             "x": (
-                _dataset_scalar(baseline, "saxs_beamstop_x_pin_user_setpoint")
+                _baseline_scalar(run, "saxs_beamstop_x_pin_user_setpoint")
+                or _dataset_scalar(baseline, "saxs_beamstop_x_pin_user_setpoint")
+                or _baseline_scalar(run, "saxs_beamstop_x_pin")
                 or _dataset_scalar(baseline, "saxs_beamstop_x_pin")
             ),
             "y": (
-                _dataset_scalar(baseline, "saxs_beamstop_y_pin_user_setpoint")
+                _baseline_scalar(run, "saxs_beamstop_y_pin_user_setpoint")
+                or _dataset_scalar(baseline, "saxs_beamstop_y_pin_user_setpoint")
+                or _baseline_scalar(run, "saxs_beamstop_y_pin")
                 or _dataset_scalar(baseline, "saxs_beamstop_y_pin")
             ),
         },
@@ -262,16 +419,41 @@ def resolve_waxs_geometry(
     energy_kev: float | None = None,
     **overrides: Any,
 ) -> WAXSGeometry:
-    """Resolve full WAXS geometry from a tiled run."""
+    """Resolve full WAXS geometry from a tiled run.
+
+    Fallback order for each parameter:
+      1. User override (``overrides`` dict)
+      2. Primary stream (per-frame value, if field present)
+      3. Baseline stream (start-of-scan snapshot — always present)
+      4. Primary configuration metadata
+      5. Start metadata / sample_name encoding
+      6. Hardcoded instrument defaults
+    """
     baseline = _read_baseline(run)
     conf = _primary_conf(run, "pil900KW")
     start = run.metadata.get("start", {})
+    sample_name = start.get("sample_name", "")
+    name_geo = parse_sample_name_geometry(sample_name)
 
-    energy_kev = energy_kev or start.get("energy") or DEFAULT_ENERGY_KEV
+    # Energy resolution: override > start metadata > baseline > sample_name > default
+    if energy_kev is None:
+        _baseline_energy_ev = _baseline_scalar(run, "energy_energy")
+        _baseline_energy_kev = (
+            _baseline_energy_ev / 1000.0 if _baseline_energy_ev is not None else None
+        )
+        energy_kev = (
+            start.get("energy")
+            or _baseline_energy_kev
+            or name_geo.get("energy_kev")
+            or DEFAULT_ENERGY_KEV
+        )
     energy_ev = float(energy_kev) * 1000.0
 
     dist_mm = (
         overrides.get("sample_distance_mm")
+        or _primary_scalar(run, "pil900KW_motor_z")
+        or _baseline_scalar(run, "pil900KW_motor_z_user_setpoint")
+        or _baseline_scalar(run, "pil900KW_motor_z")
         or _dataset_scalar(baseline, "pil900KW_motor_z_user_setpoint")
         or _dataset_scalar(baseline, "pil900KW_motor_z")
         or _conf_scalar(conf, "pil900KW_sdd_mm")
@@ -357,13 +539,186 @@ def _get_primary_field_node(run: Any, field: str) -> Any:
         ) from exc
 
 
-def _read_array_chunked(node: Any) -> np.ndarray:
+# Tiled chunks larger than this estimated byte size are pre-emptively read
+# frame-by-frame instead of as a single bulk request.  The SMI ``pil2M_image``
+# field is chunked at ~99 MB per chunk, which the tiled server has been
+# observed to reject with HTTP 500 even when smaller chunks (e.g. the WAXS
+# ``pil900KW_image`` at ~36 MB per chunk) succeed.  Threshold is intentionally
+# conservative; the per-frame fallback path is reliable but slower.
+_BULK_READ_MAX_CHUNK_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+# How many times to retry a single per-frame read on a transient server error
+# before giving up.  Backoff is linear: 1s, 2s, 3s, ...
+_PER_FRAME_RETRIES = 4
+
+
+def _estimate_max_chunk_bytes(node: Any) -> int | None:
+    """Return the byte size of the largest tiled chunk for ``node``, or None.
+
+    Uses ``node.chunks`` (tuple of per-axis chunk-size tuples) and ``dtype``
+    if available.  Returns ``None`` when the information is missing so the
+    caller can fall back to a bulk read.
+    """
+    chunks = getattr(node, "chunks", None)
+    dtype = getattr(node, "dtype", None)
+    if not chunks or dtype is None:
+        return None
+    try:
+        itemsize = int(np.dtype(dtype).itemsize)
+        # Largest chunk along each axis multiplied together
+        max_elems = 1
+        for axis_chunks in chunks:
+            if not axis_chunks:
+                return None
+            max_elems *= int(max(axis_chunks))
+        return max_elems * itemsize
+    except Exception:
+        return None
+
+
+def _read_array_via_http_full(node: Any) -> np.ndarray | None:
+    """Fetch an entire tiled array via the raw ``/array/full`` endpoint.
+
+    Bypasses the tiled client's slice serialiser (which in v0.2.x emits
+    ``?slice=:N:1,:M:1,:K:1`` with explicit strides on every axis — a form
+    the production NSLS-II tiled server rejects with HTTP 500).  Issuing
+    the request with no ``slice`` query parameter at all asks for the
+    whole array and works regardless of client version.
+
+    Returns ``None`` if the node does not expose enough metadata to use
+    this fast-path so the caller can fall back to ``node.read()``.
+    """
+    item = getattr(node, "item", None)
+    links = (item or {}).get("links") or {}
+    full_url = links.get("full")
+    http_client = None
+    ctx = getattr(node, "context", None)
+    if ctx is not None:
+        http_client = getattr(ctx, "http_client", None)
+    dtype = getattr(node, "dtype", None)
+    shape = getattr(node, "shape", None)
+    if not full_url or http_client is None or dtype is None or shape is None:
+        return None
+
+    resp = http_client.get(
+        full_url,
+        params={"format": "application/octet-stream"},
+        headers={"Accept": "application/octet-stream"},
+        timeout=300.0,
+    )
+    if resp.status_code != 200:
+        raise RuntimeError(
+            f"tiled /array/full returned HTTP {resp.status_code}: "
+            f"{resp.text[:200]}"
+        )
+    return _decode_array_response(
+        resp.content, dtype, tuple(int(s) for s in shape),
+    )
+
+
+def _decode_array_response(content: bytes, dtype: Any, shape: tuple[int, ...]) -> np.ndarray:
+    """Reconstruct a numpy array from a tiled ``/array/full`` response body."""
+    return np.frombuffer(content, dtype=np.dtype(dtype)).reshape(shape)
+
+
+def _read_one_frame_via_http(node: Any, i: int) -> np.ndarray | None:
+    """Fetch a single frame using the raw ``/array/full`` HTTP endpoint.
+
+    Works around a serialisation incompatibility in newer ``tiled`` clients
+    (>=0.2): they format slices as ``?slice=:1:1,:N:1,:M:1`` (with explicit
+    strides on every axis), which the production NSLS-II tiled server
+    rejects with HTTP 500.  The plain ``?slice=i:i+1,:,:`` form works.
+
+    Returns ``None`` if the node does not expose enough metadata to use
+    this fast-path, so the caller can fall back to the high-level client.
+    """
+    item = getattr(node, "item", None)
+    links = (item or {}).get("links") or {}
+    full_url = links.get("full")
+    http_client = None
+    ctx = getattr(node, "context", None)
+    if ctx is not None:
+        http_client = getattr(ctx, "http_client", None)
+    dtype = getattr(node, "dtype", None)
+    shape = getattr(node, "shape", None)
+    if not full_url or http_client is None or dtype is None or shape is None:
+        return None
+    if len(shape) < 1:
+        return None
+
+    # Build a slice spec the tiled server accepts: ``i:i+1`` on the leading
+    # axis, plain ``:`` on every other axis, no strides.
+    slice_parts = [f"{i}:{i + 1}"] + [":"] * (len(shape) - 1)
+    slice_spec = ",".join(slice_parts)
+
+    resp = http_client.get(
+        full_url,
+        params={"slice": slice_spec, "format": "application/octet-stream"},
+        headers={"Accept": "application/octet-stream"},
+        timeout=120.0,
+    )
+    if resp.status_code != 200:
+        # Surface the error so the caller's retry loop can see it.
+        raise RuntimeError(
+            f"tiled /array/full returned HTTP {resp.status_code} for "
+            f"frame {i}: {resp.text[:200]}"
+        )
+    frame_shape = (1, *tuple(int(s) for s in shape[1:]))
+    return _decode_array_response(resp.content, dtype, frame_shape)
+
+
+def _read_one_frame_with_retry(node: Any, i: int) -> np.ndarray:
+    """Read frame ``i`` from ``node`` with retries for transient failures."""
+    last_exc: Exception | None = None
+    for attempt in range(_PER_FRAME_RETRIES):
+        # Preferred path: raw HTTP with a server-friendly slice spec.
+        # This avoids the tiled>=0.2 client bug where slices on multi-dim
+        # arrays are serialised as ``:1:1,:N:1,:M:1`` (which the NSLS-II
+        # tiled server rejects with HTTP 500).
+        try:
+            frame = _read_one_frame_via_http(node, i)
+            if frame is not None:
+                return frame
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+
+        # Fallback 1: high-level client indexing.
+        try:
+            return np.asarray(node[i : i + 1])
+        except Exception as exc:  # noqa: BLE001 - tiled error types vary
+            last_exc = exc
+
+        # Fallback 2: ``read(slice=...)`` for clients without __getitem__.
+        try:
+            return np.asarray(node.read(slice=(slice(i, i + 1),)))
+        except Exception as exc2:  # noqa: BLE001
+            last_exc = exc2
+
+        if attempt < _PER_FRAME_RETRIES - 1:
+            time.sleep(1.0 * (attempt + 1))
+    # Exhausted retries
+    assert last_exc is not None
+    raise last_exc
+
+
+def _read_array_chunked(node: Any, parallel: bool = True, max_workers: int | None = None) -> np.ndarray:
     """Read a tiled array node frame-by-frame to avoid server-side 500s.
 
     The tiled server can return HTTP 500 when asked for a large multi-frame
     detector image in a single request.  Reading one frame at a time keeps
     each request small and works around the issue.  Falls back to a single
     ``read()`` for nodes that do not support indexed access.
+
+    Parameters
+    ----------
+    node : tiled ArrayClient
+        The tiled node to read from.
+    parallel : bool
+        If True (default), fetch frames concurrently using threads.
+        Each frame is an independent HTTP request, so thread-based
+        parallelism yields significant speedups on multi-frame scans.
+    max_workers : int | None
+        Maximum number of concurrent threads.  Defaults to min(n_frames, 8).
     """
     # Determine the leading dimension length
     shape = getattr(node, "shape", None)
@@ -371,17 +726,27 @@ def _read_array_chunked(node: Any) -> np.ndarray:
         return np.asarray(node.read())
 
     n = int(shape[0])
+    if n == 0:
+        return np.asarray(node.read())
+
+    if parallel and n > 1:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        workers = max_workers if max_workers is not None else min(n, 8)
+        frames = [None] * n
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_to_idx = {
+                executor.submit(_read_one_frame_with_retry, node, i): i
+                for i in range(n)
+            }
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                frames[idx] = future.result()
+        return np.concatenate(frames, axis=0)
+
     frames: list[np.ndarray] = []
     for i in range(n):
-        # ArrayClient supports __getitem__ slicing → returns numpy array
-        try:
-            frame = np.asarray(node[i : i + 1])
-        except Exception:
-            # Some clients return scalars / different protocols
-            frame = np.asarray(node.read(slice=(slice(i, i + 1),)))
-        frames.append(frame)
-    if not frames:
-        return np.asarray(node.read())
+        frames.append(_read_one_frame_with_retry(node, i))
     return np.concatenate(frames, axis=0)
 
 
@@ -394,26 +759,42 @@ def _read_primary_field(run: Any, field: str) -> np.ndarray:
     """
     node = _get_primary_field_node(run, field)
 
+    # Pre-emptively skip the bulk read for nodes whose tiled chunks exceed
+    # the size threshold the server has been observed to reject.  The SMI
+    # SAXS ``pil2M_image`` falls in this category; WAXS ``pil900KW_image``
+    # does not.
+    max_chunk_bytes = _estimate_max_chunk_bytes(node)
+    skip_bulk = (
+        max_chunk_bytes is not None
+        and max_chunk_bytes > _BULK_READ_MAX_CHUNK_BYTES
+    )
+
     arr: np.ndarray
-    try:
-        # Tiled ArrayClient — supports .read() returning a numpy array
-        if hasattr(node, "read"):
-            raw = node.read()
-        else:
-            raw = node[...]
-        arr = np.asarray(raw)
-    except Exception as exc:
-        # Server-side failure (commonly HTTP 500 from tiled when the
-        # requested array exceeds an internal size threshold).  Retry by
-        # streaming one frame at a time.
-        try:
-            from httpx import HTTPStatusError
-            recoverable = isinstance(exc, HTTPStatusError) or "500" in str(exc)
-        except ImportError:  # pragma: no cover
-            recoverable = "500" in str(exc)
-        if not recoverable:
-            raise
+    if skip_bulk:
         arr = _read_array_chunked(node)
+    else:
+        # Preferred bulk path: raw HTTP to the ``/array/full`` endpoint.
+        # Avoids the tiled>=0.2 slice-serialisation bug that otherwise
+        # makes ``node.read()`` 500 against the NSLS-II tiled server.
+        arr = None  # type: ignore[assignment]
+        try:
+            arr = _read_array_via_http_full(node)
+        except Exception:  # noqa: BLE001
+            arr = None
+        if arr is None:
+            try:
+                # Tiled ArrayClient — supports .read() returning a numpy array
+                if hasattr(node, "read"):
+                    raw = node.read()
+                else:
+                    raw = node[...]
+                arr = np.asarray(raw)
+            except Exception:  # noqa: BLE001 - tiled/httpx error types vary
+                # Any failure during the bulk read (HTTP 500, dask compute
+                # failure that wraps a server error, transient network blip,
+                # etc.) — retry by streaming one frame at a time.  The
+                # chunked path itself retries individual frames.
+                arr = _read_array_chunked(node)
 
     # Tiled may return 4-D: (primary_step, exposures, row, col).
     # Average over the exposures axis to get (step, row, col).
@@ -455,9 +836,16 @@ def _has_primary_field(run: Any, field: str) -> bool:
 def _read_scan_axis(run: Any, field: str) -> np.ndarray | None:
     """Read a motor field from primary; fall back to baseline if absent.
 
+    Fallback order:
+      1. Primary stream (per-frame values — only when motor is scanned)
+      2. Baseline stream via efficient per-column access (new tiled layout)
+      3. Baseline stream via full xr.Dataset read (old tiled layout)
+      4. Sample name parsing (last resort)
+
     Reads only the requested field directly from tiled (avoids pulling the
     full primary stream, which contains the multi-GB detector arrays).
     """
+    # 1. Primary stream (per-frame varying values)
     if _has_primary_field(run, field):
         try:
             node = _get_primary_field_node(run, field)
@@ -465,12 +853,26 @@ def _read_scan_axis(run: Any, field: str) -> np.ndarray | None:
             return np.asarray(values, dtype=float)
         except Exception:
             pass
-    # Fallback: read from baseline (start-of-scan snapshot).
-    # Baseline shape is (2,) — [start, end]; take the first value.
+
+    # 2. Baseline stream (efficient per-column path)
+    val = _baseline_scalar(run, field)
+    if val is not None:
+        return np.array([float(val)], dtype=float)
+
+    # 3. Baseline via full xr.Dataset (legacy fallback)
     baseline = _read_baseline(run)
     val = _dataset_scalar(baseline, field)
     if val is not None:
         return np.array([float(val)], dtype=float)
+
+    # 4. Sample name parsing (last resort for waxs_arc)
+    if field == WAXS_ARC_FIELD:
+        start = run.metadata.get("start", {})
+        name_geo = parse_sample_name_geometry(start.get("sample_name", ""))
+        arc_deg = name_geo.get("waxs_arc_deg")
+        if arc_deg is not None:
+            return np.array([arc_deg], dtype=float)
+
     return None
 
 
@@ -494,6 +896,16 @@ def load_saxs_raw(
     """
     images = _read_primary_field(run, SAXS_IMAGE_FIELD)
     start = run.metadata.get("start", {})
+    sample_name = start.get("sample_name", "")
+    name_geo = parse_sample_name_geometry(sample_name)
+
+    # Resolve incident angle: primary > baseline > sample_name
+    incident_angle_deg = (
+        _primary_scalar(run, "stage_th")
+        or _baseline_scalar(run, "stage_th")
+        or name_geo.get("incident_angle_deg")
+        or name_geo.get("theta_deg")
+    )
 
     attrs: dict[str, Any] = {
         # PyHyperScattering / pyFAI geometry contract
@@ -514,6 +926,7 @@ def load_saxs_raw(
         "smi_beam_center_col_px": geo.beam_center_col_px,
         "smi_sample_distance_mm": geo.dist_m * 1000.0,
         "smi_active_beamstop":    geo.active_beamstop,
+        "smi_incident_angle_deg": incident_angle_deg,
         # Run identity
         "uid":         start.get("uid", ""),
         "scan_id":     start.get("scan_id"),
@@ -568,6 +981,16 @@ def load_waxs_raw(
     """
     images = _read_primary_field(run, WAXS_IMAGE_FIELD)
     start  = run.metadata.get("start", {})
+    sample_name = start.get("sample_name", "")
+    name_geo = parse_sample_name_geometry(sample_name)
+
+    # Resolve incident angle: primary > baseline > sample_name
+    incident_angle_deg = (
+        _primary_scalar(run, "stage_th")
+        or _baseline_scalar(run, "stage_th")
+        or name_geo.get("incident_angle_deg")
+        or name_geo.get("theta_deg")
+    )
 
     arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD)
     bsx_values = _read_scan_axis(run, WAXS_BSX_FIELD)
@@ -633,6 +1056,7 @@ def load_waxs_raw(
         "smi_rotation_k":            geo.rotation_k,
         "smi_panels":                panels_attr,
         "smi_waxs_bsx_per_frame":    bsx_values.tolist(),
+        "smi_incident_angle_deg":    incident_angle_deg,
         # Run identity
         "uid":         start.get("uid", ""),
         "scan_id":     start.get("scan_id"),
@@ -653,45 +1077,132 @@ def load_waxs_raw(
 # Scan info utility
 # ---------------------------------------------------------------------------
 
-def infer_detectors_and_steps(run: Any, primary: xr.Dataset) -> dict[str, Any]:
-    """Inspect a tiled run to determine detectors, scan axes, and frame count."""
+def infer_detectors_and_steps(
+    run: Any, primary: xr.Dataset | None = None,
+) -> dict[str, Any]:
+    """Inspect a tiled run to determine detectors, scan axes, and frame count.
+
+    Parameters
+    ----------
+    run :
+        Bluesky/tiled run object.
+    primary : xr.Dataset, optional
+        If provided, used directly (legacy fast path for callers that already
+        have the full primary stream loaded).  When ``None`` (preferred), the
+        function introspects the tiled ``primary`` container WITHOUT calling
+        ``.read()`` on the detector image fields — only field names, shapes,
+        and 1-D scan axes are fetched, which avoids the multi-GB request that
+        can trigger an HTTP 500 from the tiled backend.
+    """
     start = run.metadata.get("start", {})
-    vars_all = sorted(map(str, primary.data_vars.keys()))
+
+    if primary is not None:
+        vars_all = sorted(map(str, primary.data_vars.keys()))
+
+        first_dim = next(iter(primary.dims), None)
+        n_frames = (
+            int(primary.sizes.get(first_dim, 0)) if first_dim is not None else 0
+        )
+        if n_frames == 0 and vars_all:
+            first_var = primary[vars_all[0]]
+            n_frames = int(first_var.shape[0]) if first_var.ndim > 0 else 1
+
+        step_candidates: list[dict[str, Any]] = []
+        for name in vars_all:
+            da = primary[name]
+            if da.ndim != 1:
+                continue
+            if int(da.shape[0]) != n_frames:
+                continue
+            if not np.issubdtype(da.dtype, np.number):
+                continue
+            values = np.asarray(da.values, dtype=float)
+            finite = values[np.isfinite(values)]
+            unique = np.unique(finite)
+            if unique.size <= 1:
+                continue
+            step_candidates.append(
+                {
+                    "name": name,
+                    "n_unique": int(unique.size),
+                    "min": float(np.nanmin(values)),
+                    "max": float(np.nanmax(values)),
+                }
+            )
+    else:
+        # Tiled-introspection path — no bulk reads of detector arrays.
+        try:
+            primary_node = run["primary"]
+        except Exception:
+            primary_node = None
+
+        # Modern bluesky-tiled layout: primary -> data -> <field>
+        data_node = None
+        if primary_node is not None:
+            try:
+                data_node = primary_node["data"]
+            except Exception:
+                data_node = None
+        field_container = data_node if data_node is not None else primary_node
+
+        vars_all: list[str] = []
+        if field_container is not None:
+            try:
+                vars_all = sorted(map(str, list(field_container)))
+            except Exception:
+                vars_all = []
+
+        def _shape_of(name: str) -> tuple[int, ...]:
+            try:
+                node = field_container[name]
+            except Exception:
+                return ()
+            shape = getattr(node, "shape", None)
+            if shape is None:
+                try:
+                    shape = node.structure().shape  # tiled ArrayClient
+                except Exception:
+                    shape = ()
+            return tuple(int(s) for s in shape) if shape else ()
+
+        # Determine n_frames from the first array-like field with a
+        # leading dimension.  Avoids reading detector data.
+        n_frames = 0
+        for name in vars_all:
+            shp = _shape_of(name)
+            if shp:
+                n_frames = int(shp[0])
+                break
+
+        step_candidates: list[dict[str, Any]] = []
+        for name in vars_all:
+            shp = _shape_of(name)
+            if len(shp) != 1 or shp[0] != n_frames:
+                continue
+            try:
+                node = field_container[name]
+                values = np.asarray(
+                    node.read() if hasattr(node, "read") else node[...],
+                    dtype=float,
+                )
+            except Exception:
+                continue
+            finite = values[np.isfinite(values)]
+            unique = np.unique(finite)
+            if unique.size <= 1:
+                continue
+            step_candidates.append(
+                {
+                    "name": name,
+                    "n_unique": int(unique.size),
+                    "min": float(np.nanmin(values)),
+                    "max": float(np.nanmax(values)),
+                }
+            )
 
     detector_prefixes = sorted(
         {name.split("_")[0] for name in vars_all if "_" in name}
     )
-
-    first_dim = next(iter(primary.dims), None)
-    n_frames = (
-        int(primary.sizes.get(first_dim, 0)) if first_dim is not None else 0
-    )
-    if n_frames == 0 and vars_all:
-        first_var = primary[vars_all[0]]
-        n_frames = int(first_var.shape[0]) if first_var.ndim > 0 else 1
-
-    step_candidates: list[dict[str, Any]] = []
-    for name in vars_all:
-        da = primary[name]
-        if da.ndim != 1:
-            continue
-        if int(da.shape[0]) != n_frames:
-            continue
-        if not np.issubdtype(da.dtype, np.number):
-            continue
-        values = np.asarray(da.values, dtype=float)
-        finite = values[np.isfinite(values)]
-        unique = np.unique(finite)
-        if unique.size <= 1:
-            continue
-        step_candidates.append(
-            {
-                "name": name,
-                "n_unique": int(unique.size),
-                "min": float(np.nanmin(values)),
-                "max": float(np.nanmax(values)),
-            }
-        )
 
     return {
         "uid": start.get("uid"),
@@ -740,17 +1251,64 @@ class TiledSMISWAXSLoader:
         tiled_uri: str = DEFAULT_TILED_URI,
         catalog: str = DEFAULT_CATALOG,
         energy_kev: float | None = None,
+        api_key: str | None = None,
     ) -> None:
         self.tiled_uri = tiled_uri
         self.catalog = catalog
         self.energy_kev = energy_kev
+        self.api_key = api_key
+        self._root_client = None
+        self._catalog_client = None
+
+    # ------------------------------------------------------------------
+    # Authentication helpers
+    # ------------------------------------------------------------------
+    def _get_root_client(self) -> Any:
+        """Return the cached root tiled client, creating it on first use."""
+        if self._root_client is None:
+            from tiled.client import from_uri
+            kwargs: dict[str, Any] = {}
+            if self.api_key is not None:
+                kwargs["api_key"] = self.api_key
+            self._root_client = from_uri(self.tiled_uri, **kwargs)
+        return self._root_client
+
+    def login(self, **kwargs: Any) -> Any:
+        """Interactively log in to the tiled server.
+
+        Equivalent to ``tiled.client.from_uri(uri).login()``.  Any keyword
+        arguments are forwarded to the underlying tiled client's ``login``
+        method (e.g. ``provider=...``).  After a successful login the
+        catalog client is invalidated so the next access uses the
+        authenticated session.
+        """
+        client = self._get_root_client()
+        result = client.login(**kwargs)
+        # Force re-resolution of the catalog through the now-authenticated
+        # root client so subsequent reads carry the auth token.
+        self._catalog_client = None
+        return result
+
+    def logout(self) -> None:
+        """Log out of the tiled server and clear cached clients."""
+        if self._root_client is not None:
+            try:
+                self._root_client.logout()
+            finally:
+                self._root_client = None
         self._catalog_client = None
 
     def _get_catalog(self) -> Any:
         if self._catalog_client is None:
-            from tiled.client import from_uri
-            # Single path lookup — one HTTP round-trip
-            self._catalog_client = from_uri(self.tiled_uri)[self.catalog]
+            # Walk the slash-separated catalog path from the root client so
+            # the same authenticated session is reused for both login and
+            # data access.
+            node = self._get_root_client()
+            for part in self.catalog.split("/"):
+                if not part:
+                    continue
+                node = node[part]
+            self._catalog_client = node
         return self._catalog_client
 
     def _get_run(self, uid: str) -> Any:
