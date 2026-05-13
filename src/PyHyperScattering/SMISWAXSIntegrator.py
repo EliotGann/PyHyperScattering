@@ -937,6 +937,91 @@ def make_saxs_large_area_masks(
 # Histogram binning helpers
 # ===================================================================
 
+
+def _histogram2d_pixel_split(
+    q2d: np.ndarray,
+    chi2d: np.ndarray,
+    img: np.ndarray,
+    valid: np.ndarray,
+    q_edges: np.ndarray,
+    chi_edges: np.ndarray,
+    pixel_splitting: int = 1,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Histogram with optional pyFAI-style pixel splitting.
+
+    When *pixel_splitting* > 1 each pixel is subdivided into an
+    NxN grid of sub-pixels.  The q/chi position of each sub-pixel is
+    estimated via gradient-based interpolation of the full q/chi maps,
+    and the pixel intensity is fractionally distributed across the bins
+    the sub-pixels fall into.
+
+    Parameters
+    ----------
+    q2d, chi2d : 2-D arrays
+        Per-pixel q and chi maps (same shape as *img*).
+    img : 2-D array
+        Intensity image (may contain NaN for invalid pixels).
+    valid : 2-D bool array
+        Mask of pixels to include in the histogram.
+    q_edges, chi_edges : 1-D arrays
+        Bin edges for the output histogram.
+    pixel_splitting : int
+        Number of sub-pixel divisions per axis.  1 (default) disables
+        splitting and falls back to the standard single-point histogram.
+
+    Returns
+    -------
+    I_hist, N_hist : 2-D arrays shaped (n_q, n_chi)
+    """
+    if pixel_splitting <= 1:
+        q_sel = q2d[valid].ravel()
+        chi_sel = chi2d[valid].ravel()
+        I_sel = img[valid].ravel()
+        I_hist, _, _ = np.histogram2d(
+            q_sel, chi_sel, bins=[q_edges, chi_edges], weights=I_sel,
+        )
+        N_hist, _, _ = np.histogram2d(
+            q_sel, chi_sel, bins=[q_edges, chi_edges],
+        )
+        return I_hist, N_hist
+
+    # Gradient-based sub-pixel interpolation
+    dq_dr = np.gradient(q2d, axis=0)
+    dq_dc = np.gradient(q2d, axis=1)
+    dchi_dr = np.gradient(chi2d, axis=0)
+    dchi_dc = np.gradient(chi2d, axis=1)
+
+    n = pixel_splitting
+    offsets = np.linspace(-0.5 + 0.5 / n, 0.5 - 0.5 / n, n)
+    weight = 1.0 / (n * n)
+
+    n_q = len(q_edges) - 1
+    n_chi = len(chi_edges) - 1
+    I_hist = np.zeros((n_q, n_chi), dtype=float)
+    N_hist = np.zeros((n_q, n_chi), dtype=float)
+
+    for dr in offsets:
+        for dc in offsets:
+            q_sub = q2d + dr * dq_dr + dc * dq_dc
+            chi_sub = chi2d + dr * dchi_dr + dc * dchi_dc
+
+            sub_valid = valid & np.isfinite(q_sub) & np.isfinite(chi_sub)
+            q_sel = q_sub[sub_valid].ravel()
+            chi_sel = chi_sub[sub_valid].ravel()
+            I_sel = img[sub_valid].ravel() * weight
+
+            I_h, _, _ = np.histogram2d(
+                q_sel, chi_sel, bins=[q_edges, chi_edges], weights=I_sel,
+            )
+            N_h, _, _ = np.histogram2d(
+                q_sel, chi_sel, bins=[q_edges, chi_edges],
+            )
+            I_hist += I_h
+            N_hist += N_h * weight
+
+    return I_hist, N_hist
+
+
 def _qchi_and_iq(
     accum_I: np.ndarray,
     accum_N: np.ndarray,
@@ -1792,6 +1877,7 @@ def integrate_saxs(
     dezinger_threshold: float | None = None,
     dezinger_kernel: int = 5,
     cache_geometry: bool = True,
+    pixel_splitting: int = 1,
 ) -> dict[str, Any]:
     """SAXS reduction via direct pixel-space q-map and histogram binning."""
     attrs = saxs_raw.attrs
@@ -1925,14 +2011,9 @@ def integrate_saxs(
         i_hist = np.zeros((n_q, n_chi), dtype=float)
         n_hist = np.zeros((n_q, n_chi), dtype=float)
         if np.any(valid):
-            q_sel = q2d[valid].ravel()
-            chi_sel = chi_deg_2d[valid].ravel()
-            i_sel = img[valid].ravel()
-            i_hist, _, _ = np.histogram2d(
-                q_sel, chi_sel, bins=[q_edges, chi_edges], weights=i_sel
-            )
-            n_hist, _, _ = np.histogram2d(
-                q_sel, chi_sel, bins=[q_edges, chi_edges]
+            i_hist, n_hist = _histogram2d_pixel_split(
+                q2d, chi_deg_2d, img, valid, q_edges, chi_edges,
+                pixel_splitting=pixel_splitting,
             )
         accum_I += i_hist
         accum_N += n_hist
@@ -1998,6 +2079,7 @@ def integrate_waxs(
     dezinger_threshold: float | None = None,
     dezinger_kernel: int = 5,
     cache_geometry: bool = True,
+    pixel_splitting: int = 1,
 ) -> dict[str, Any]:
     """WAXS reduction via MultiPanelArcDetector per arc-angle frame."""
     attrs = waxs_raw.attrs
@@ -2148,11 +2230,9 @@ def integrate_waxs(
         chi_sel = chi_px[valid].ravel()
         I_sel = img_rot[valid].ravel()
 
-        I_hist, _, _ = np.histogram2d(
-            q_sel, chi_sel, bins=[q_edges, chi_edges], weights=I_sel
-        )
-        N_hist, _, _ = np.histogram2d(
-            q_sel, chi_sel, bins=[q_edges, chi_edges]
+        I_hist, N_hist = _histogram2d_pixel_split(
+            qabs_px, chi_px, img_rot, valid, q_edges, chi_edges,
+            pixel_splitting=pixel_splitting,
         )
         accum_I += I_hist
         accum_N += N_hist
@@ -2220,6 +2300,7 @@ def reduce_smi_combined(
     dezinger_kernel: int = 5,
     waxs_beam_col_per_arc_deg: float = 0.0,
     cache_geometry: bool = True,
+    pixel_splitting: int = 1,
 ) -> CombinedReductionResult:
     """
     Full SAXS + WAXS reduction pipeline.
@@ -2277,6 +2358,13 @@ def reduce_smi_combined(
         expensive pixel-position trigonometry.  Safe across scans that share
         calibration.  Call :func:`clear_geometry_cache` to free memory or
         after programmatically changing calibration parameters.
+    pixel_splitting : int
+        Number of sub-pixel divisions per axis for fractional pixel
+        splitting during histogram binning.  1 (default) disables splitting
+        (each pixel contributes to a single bin).  Values > 1 subdivide each
+        pixel into an NxN grid and distribute intensity fractionally across
+        bins using gradient-based interpolation of the q/chi maps.  Typical
+        values are 2–4.
 
     Returns
     -------
@@ -2285,6 +2373,7 @@ def reduce_smi_combined(
     import time as _time
     from PyHyperScattering.SMISWAXSLoader import (
         TiledSMISWAXSLoader,
+        clear_baseline_cache,
         infer_detectors_and_steps,
         resolve_saxs_geometry,
         resolve_waxs_geometry,
@@ -2295,11 +2384,10 @@ def reduce_smi_combined(
     opts = dict(backend_options or {})
     t0 = _time.perf_counter()
 
-    # Load raw data
-    from tiled.client import from_uri
-
-    cat = from_uri(tiled_uri)[catalog]
-    run = cat[uid]
+    # Load raw data — reuse a single loader (and its tiled session) for
+    # everything so we don't call from_uri / authenticate twice.
+    loader = TiledSMISWAXSLoader(tiled_uri=tiled_uri, catalog=catalog)
+    run = loader._get_run(uid)
 
     # Avoid run["primary"].read() — that pulls every variable in the primary
     # stream including the multi-frame detector arrays, which can trigger
@@ -2307,7 +2395,6 @@ def reduce_smi_combined(
     # introspects the tiled containers directly.
     scan_info = infer_detectors_and_steps(run, None)
 
-    loader = TiledSMISWAXSLoader(tiled_uri=tiled_uri, catalog=catalog)
     saxs_raw = loader.loadSingleImage(uid, detector="saxs")
     waxs_raw = loader.loadSingleImage(uid, detector="waxs")
     has_saxs = saxs_raw is not None
@@ -2373,6 +2460,7 @@ def reduce_smi_combined(
             dezinger_threshold=dezinger_threshold,
             dezinger_kernel=dezinger_kernel,
             cache_geometry=cache_geometry,
+            pixel_splitting=pixel_splitting,
         )
         t_saxs_end = _time.perf_counter()
 
@@ -2464,6 +2552,7 @@ def reduce_smi_combined(
             dezinger_threshold=dezinger_threshold,
             dezinger_kernel=dezinger_kernel,
             cache_geometry=cache_geometry,
+            pixel_splitting=pixel_splitting,
         )
         t_waxs_end = _time.perf_counter()
 
@@ -2488,6 +2577,9 @@ def reduce_smi_combined(
         "waxs_integrate": t_waxs_end - t_waxs_start,
         "merge": t_merge_end - t_merge_start,
     }
+
+    # Free cached baseline data for this run
+    clear_baseline_cache()
 
     return CombinedReductionResult(
         uid=uid,

@@ -31,6 +31,19 @@ import xarray as xr
 
 
 # ---------------------------------------------------------------------------
+# Per-run baseline cache  (avoids re-reading 564-column DataFrames)
+# ---------------------------------------------------------------------------
+_BASELINE_CACHE: dict[str, xr.Dataset | None] = {}  # keyed by run UID
+_BASELINE_COLUMNS_CACHE: dict[str, list[str]] = {}   # keyed by run UID
+
+
+def clear_baseline_cache() -> None:
+    """Free cached baseline data.  Safe to call at any time."""
+    _BASELINE_CACHE.clear()
+    _BASELINE_COLUMNS_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
@@ -81,45 +94,74 @@ def _as_scalar(value: Any) -> Any:
     return item.item() if hasattr(item, "item") else item
 
 
+def _run_uid(run: Any) -> str:
+    """Extract a stable UID string from a tiled run object."""
+    try:
+        return run.metadata["start"]["uid"]
+    except Exception:
+        # Fallback: use object id if metadata is unavailable
+        return str(id(run))
+
+
 def _read_baseline(run: Any) -> xr.Dataset | None:
     """Read the baseline stream as an xr.Dataset (legacy path).
 
     Falls back to the new bluesky-tiled-plugins layout where baseline is
     accessed via ``run["baseline"]["internal"]`` (a DataFrameClient) rather
     than ``run["baseline"].read()`` (which raises KeyError('data')).
+
+    Results are cached per run UID to avoid repeated conversion of the
+    564-column DataFrame into an xr.Dataset (which is very expensive due
+    to xarray merge/alignment overhead).
     """
+    _rid = _run_uid(run)
+    if _rid in _BASELINE_CACHE:
+        return _BASELINE_CACHE[_rid]
+
+    result: xr.Dataset | None = None
     try:
-        return run["baseline"].read()
+        result = run["baseline"].read()
     except (KeyError, Exception):
         pass
-    # New layout: baseline["internal"] is a DataFrameClient (pandas-like).
-    # Convert to xr.Dataset so existing _dataset_scalar() calls still work.
-    try:
-        internal = run["baseline"]["internal"]
-        df = internal.read() if hasattr(internal, "read") else None
-        if df is not None:
-            import pandas as pd
-            if isinstance(df, pd.DataFrame):
-                return xr.Dataset.from_dataframe(df)
-            # May already be an xr.Dataset
-            if isinstance(df, xr.Dataset):
-                return df
-    except Exception:
-        pass
-    return None
+    if result is None:
+        # New layout: baseline["internal"] is a DataFrameClient (pandas-like).
+        # Convert to xr.Dataset so existing _dataset_scalar() calls still work.
+        try:
+            internal = run["baseline"]["internal"]
+            df = internal.read() if hasattr(internal, "read") else None
+            if df is not None:
+                import pandas as pd
+                if isinstance(df, pd.DataFrame):
+                    result = xr.Dataset.from_dataframe(df)
+                elif isinstance(df, xr.Dataset):
+                    result = df
+        except Exception:
+            pass
+
+    _BASELINE_CACHE[_rid] = result
+    return result
 
 
 def _baseline_scalar(run: Any, key: str) -> Any:
     """Read a single scalar from the baseline stream (first value).
 
-    Tries the efficient per-column access path on the new tiled layout
-    first (avoids pulling all 564 columns), then falls back to reading the
-    full baseline as xr.Dataset.
+    Uses the cached full-baseline Dataset when available (avoids per-key
+    HTTP round-trips).  Falls back to per-column tiled access, then to a
+    full baseline read.
     """
-    # Fast path: baseline/internal DataFrameClient with per-column access
+    # Fastest path: use the already-cached xr.Dataset
+    _rid = _run_uid(run)
+    if _rid in _BASELINE_CACHE:
+        return _dataset_scalar(_BASELINE_CACHE[_rid], key)
+
+    # Per-column access via tiled (one HTTP call per key)
     try:
         internal = run["baseline"]["internal"]
-        columns = list(internal)
+        if _rid in _BASELINE_COLUMNS_CACHE:
+            columns = _BASELINE_COLUMNS_CACHE[_rid]
+        else:
+            columns = list(internal)
+            _BASELINE_COLUMNS_CACHE[_rid] = columns
         if key in columns:
             vals = internal[key].read() if hasattr(internal[key], "read") else internal[key][...]
             return _as_scalar(np.asarray(vals))
