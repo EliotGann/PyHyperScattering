@@ -1276,6 +1276,7 @@ def infer_detectors_and_steps(
                     "n_unique": int(unique.size),
                     "min": float(np.nanmin(values)),
                     "max": float(np.nanmax(values)),
+                    "values": values,
                 }
             )
     else:
@@ -1346,6 +1347,7 @@ def infer_detectors_and_steps(
                     "n_unique": int(unique.size),
                     "min": float(np.nanmin(values)),
                     "max": float(np.nanmax(values)),
+                    "values": values,
                 }
             )
 

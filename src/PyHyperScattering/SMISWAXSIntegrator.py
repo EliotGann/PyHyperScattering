@@ -1253,6 +1253,119 @@ def merge_iq_profiles(
     )
 
 
+def _build_per_frame_iq(
+    merged_iq: xr.Dataset | None,
+    saxs_result: dict[str, Any] | None,
+    waxs_result: dict[str, Any] | None,
+    scan_info: dict[str, Any] | None = None,
+) -> xr.Dataset | None:
+    """Build per-frame I(q) Dataset on the same q grid as merged_iq.
+
+    Combines per-frame SAXS and WAXS I(q) via interpolation onto the
+    merged q grid, then produces a count-weighted merge per frame.
+
+    If *scan_info* is provided and contains per-frame primary-stream
+    scalars (step_candidates with a 'values' key), they are attached
+    as data variables on the (frame,) dimension.
+
+    Returns
+    -------
+    xr.Dataset with dims (frame, q) and variables I, saxs_I, waxs_I,
+    plus any per-frame primary scalars, or None if no per-frame data
+    is available.
+    """
+    if merged_iq is None:
+        return None
+
+    q_grid = np.asarray(merged_iq["q"].values, dtype=float)
+    n_q = len(q_grid)
+
+    saxs_iq_frames = saxs_result["iq_frames"] if saxs_result else None
+    waxs_iq_frames = waxs_result["iq_frames"] if waxs_result else None
+
+    if saxs_iq_frames is None and waxs_iq_frames is None:
+        return None
+
+    # Determine number of frames from whichever detector is present
+    if saxs_iq_frames is not None and waxs_iq_frames is not None:
+        n_frames = max(
+            len(saxs_iq_frames["frame"]),
+            len(waxs_iq_frames["frame"]),
+        )
+    elif saxs_iq_frames is not None:
+        n_frames = len(saxs_iq_frames["frame"])
+    else:
+        n_frames = len(waxs_iq_frames["frame"])
+
+    saxs_I_2d = np.full((n_frames, n_q), np.nan)
+    waxs_I_2d = np.full((n_frames, n_q), np.nan)
+
+    if saxs_iq_frames is not None:
+        saxs_q_src = np.asarray(saxs_iq_frames["q"].values, dtype=float)
+        saxs_I_src = np.asarray(saxs_iq_frames["I"].values, dtype=float)
+        n_saxs = saxs_I_src.shape[0]
+        for fi in range(min(n_saxs, n_frames)):
+            saxs_I_2d[fi] = _interp_axis(saxs_q_src, saxs_I_src[fi], q_grid, np.nan)
+
+    if waxs_iq_frames is not None:
+        waxs_q_src = np.asarray(waxs_iq_frames["q"].values, dtype=float)
+        waxs_I_src = np.asarray(waxs_iq_frames["I"].values, dtype=float)
+        n_waxs = waxs_I_src.shape[0]
+        for fi in range(min(n_waxs, n_frames)):
+            waxs_I_2d[fi] = _interp_axis(waxs_q_src, waxs_I_src[fi], q_grid, np.nan)
+
+    # Count-weighted merge per frame (same logic as merge_iq_profiles)
+    saxs_N_2d = np.zeros((n_frames, n_q), dtype=float)
+    waxs_N_2d = np.zeros((n_frames, n_q), dtype=float)
+
+    if saxs_iq_frames is not None:
+        saxs_counts_src = np.asarray(saxs_iq_frames["counts"].values, dtype=float)
+        saxs_q_src = np.asarray(saxs_iq_frames["q"].values, dtype=float)
+        n_saxs = saxs_counts_src.shape[0]
+        for fi in range(min(n_saxs, n_frames)):
+            saxs_N_2d[fi] = _interp_axis(saxs_q_src, saxs_counts_src[fi], q_grid, 0.0)
+
+    if waxs_iq_frames is not None:
+        waxs_counts_src = np.asarray(waxs_iq_frames["counts"].values, dtype=float)
+        waxs_q_src = np.asarray(waxs_iq_frames["q"].values, dtype=float)
+        n_waxs = waxs_counts_src.shape[0]
+        for fi in range(min(n_waxs, n_frames)):
+            waxs_N_2d[fi] = _interp_axis(waxs_q_src, waxs_counts_src[fi], q_grid, 0.0)
+
+    total_N = saxs_N_2d + waxs_N_2d
+    with np.errstate(divide="ignore", invalid="ignore"):
+        merged_I_2d = np.where(
+            total_N > 0,
+            (np.nan_to_num(saxs_I_2d, nan=0.0) * saxs_N_2d
+             + np.nan_to_num(waxs_I_2d, nan=0.0) * waxs_N_2d) / total_N,
+            np.nan,
+        )
+
+    data_vars: dict[str, Any] = {
+        "I": (("frame", "q"), merged_I_2d),
+        "saxs_I": (("frame", "q"), saxs_I_2d),
+        "waxs_I": (("frame", "q"), waxs_I_2d),
+    }
+
+    # Attach per-frame primary-stream scalars as data variables
+    if scan_info is not None:
+        for cand in scan_info.get("step_candidates", []):
+            vals = cand.get("values")
+            if vals is None:
+                continue
+            vals = np.asarray(vals, dtype=float)
+            if vals.shape[0] == n_frames:
+                data_vars[cand["name"]] = ("frame", vals)
+
+    return xr.Dataset(
+        data_vars,
+        coords={
+            "q": q_grid,
+            "frame": np.arange(n_frames, dtype=int),
+        },
+    )
+
+
 # -------------------------------------------------------------------
 # Multi-scan merging
 # -------------------------------------------------------------------
@@ -1372,6 +1485,7 @@ class CombinedReductionResult:
     waxs: dict[str, Any] | None
     merged_qchi: xr.Dataset | None
     merged_iq: xr.Dataset | None
+    per_frame_iq: xr.Dataset | None = None
     timing: dict[str, float] | None = None
     geometry: str = "transmission"
     incident_angle_deg: float = 0.0
@@ -2583,6 +2697,7 @@ def reduce_smi_combined(
 
     merged_qchi = merge_q_chi_weighted(saxs_qchi, waxs_qchi, n_q=n_q, n_chi=n_chi)
     merged_iq = merge_iq_profiles(merged_qchi, saxs_iq, waxs_iq)
+    per_frame_iq = _build_per_frame_iq(merged_iq, saxs_result, waxs_result, scan_info=scan_info)
     t_merge_end = _time.perf_counter()
 
     timing = {
@@ -2604,6 +2719,7 @@ def reduce_smi_combined(
         waxs=waxs_result,
         merged_qchi=merged_qchi,
         merged_iq=merged_iq,
+        per_frame_iq=per_frame_iq,
         timing=timing,
         geometry=geometry,
         incident_angle_deg=incident_angle_deg,
