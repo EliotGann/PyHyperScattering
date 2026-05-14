@@ -35,12 +35,14 @@ import xarray as xr
 # ---------------------------------------------------------------------------
 _BASELINE_CACHE: dict[str, xr.Dataset | None] = {}  # keyed by run UID
 _BASELINE_COLUMNS_CACHE: dict[str, list[str]] = {}   # keyed by run UID
+_TARGET_FILE_NAME_CACHE: dict[str, list[dict[str, float]] | None] = {}  # keyed by run UID
 
 
 def clear_baseline_cache() -> None:
-    """Free cached baseline data.  Safe to call at any time."""
+    """Free cached baseline and per-run data.  Safe to call at any time."""
     _BASELINE_CACHE.clear()
     _BASELINE_COLUMNS_CACHE.clear()
+    _TARGET_FILE_NAME_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +220,60 @@ def _primary_scalar(run: Any, field: str) -> Any:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Primary/internal stream helpers
+# ---------------------------------------------------------------------------
+
+def _has_primary_internal_field(run: Any, field: str) -> bool:
+    """Return True if the given field exists in primary/internal."""
+    try:
+        internal = run["primary"]["internal"]
+        return field in list(internal)
+    except Exception:
+        return False
+
+
+def _read_primary_internal_array(run: Any, field: str) -> np.ndarray | None:
+    """Read a per-frame array from primary/internal.
+
+    Returns None if the field is not present or cannot be read.
+    """
+    try:
+        internal = run["primary"]["internal"]
+        if field not in list(internal):
+            return None
+        node = internal[field]
+        values = node.read() if hasattr(node, "read") else node[...]
+        return np.asarray(values)
+    except Exception:
+        return None
+
+
+def _read_target_file_name_geometry(run: Any) -> list[dict[str, float]] | None:
+    """Parse per-frame geometry from the target_file_name field in primary/internal.
+
+    Returns a list of dicts (one per frame), each containing parsed geometry
+    parameters (waxs_arc_deg, energy_kev, incident_angle_deg, etc.).
+    Returns None if target_file_name is not available.
+    """
+    _rid = _run_uid(run)
+    if _rid in _TARGET_FILE_NAME_CACHE:
+        return _TARGET_FILE_NAME_CACHE[_rid]
+
+    raw = _read_primary_internal_array(run, "target_file_name")
+    if raw is None:
+        _TARGET_FILE_NAME_CACHE[_rid] = None
+        return None
+
+    result = []
+    for name in raw:
+        name_str = str(name) if not isinstance(name, str) else name
+        result.append(parse_sample_name_geometry(name_str))
+
+    _TARGET_FILE_NAME_CACHE[_rid] = result
+    return result
+
+
 def _energy_to_wavelength_m(energy_ev: float) -> float:
     return _HBAR_C_EV_M / float(energy_ev)
 
@@ -250,10 +306,14 @@ def parse_sample_name_geometry(sample_name: str) -> dict[str, float]:
     if m:
         result["sdd_m"] = float(m.group(1))
 
-    # Photon energy: _16.10keV_
+    # Photon energy: _16.10keV_ or _4064.00eV_
     m = re.search(r"_([\d.]+)keV", sample_name)
     if m:
         result["energy_kev"] = float(m.group(1))
+    else:
+        m = re.search(r"_([\d.]+)eV", sample_name)
+        if m:
+            result["energy_kev"] = float(m.group(1)) / 1000.0
 
     # Incident angle: _ai0.12_
     m = re.search(r"_ai([\d.]+)", sample_name)
@@ -876,18 +936,20 @@ def _has_primary_field(run: Any, field: str) -> bool:
 
 
 def _read_scan_axis(run: Any, field: str) -> np.ndarray | None:
-    """Read a motor field from primary; fall back to baseline if absent.
+    """Read a motor field from primary; fall back to other sources if absent.
 
     Fallback order:
-      1. Primary stream (per-frame values — only when motor is scanned)
-      2. Baseline stream via efficient per-column access (new tiled layout)
-      3. Baseline stream via full xr.Dataset read (old tiled layout)
-      4. Sample name parsing (last resort)
+      1. Primary stream data fields (per-frame values — when motor is scanned)
+      2. Primary/internal stream (per-frame values from non-scanned signals)
+      3. target_file_name parsing from primary/internal (per-frame encoded)
+      4. Baseline stream via efficient per-column access (new tiled layout)
+      5. Baseline stream via full xr.Dataset read (old tiled layout)
+      6. Sample name parsing from start document (last resort)
 
     Reads only the requested field directly from tiled (avoids pulling the
     full primary stream, which contains the multi-GB detector arrays).
     """
-    # 1. Primary stream (per-frame varying values)
+    # 1. Primary stream data fields (per-frame varying values)
     if _has_primary_field(run, field):
         try:
             node = _get_primary_field_node(run, field)
@@ -896,24 +958,59 @@ def _read_scan_axis(run: Any, field: str) -> np.ndarray | None:
         except Exception:
             pass
 
-    # 2. Baseline stream (efficient per-column path)
+    # 2. Primary/internal stream (per-frame signals not in data/)
+    if _has_primary_internal_field(run, field):
+        try:
+            arr = _read_primary_internal_array(run, field)
+            if arr is not None and arr.size > 0:
+                return np.asarray(arr, dtype=float)
+        except (ValueError, TypeError):
+            # Field exists but is non-numeric (e.g. target_file_name) — skip
+            pass
+
+    # 3. target_file_name parsing (per-frame geometry encoded in filenames)
+    _TFN_FIELD_MAP = {
+        WAXS_ARC_FIELD: "waxs_arc_deg",
+        "energy_energy": "energy_kev",  # returns keV, caller converts
+    }
+    if field in _TFN_FIELD_MAP:
+        tfn_geo = _read_target_file_name_geometry(run)
+        if tfn_geo is not None:
+            geo_key = _TFN_FIELD_MAP[field]
+            values = []
+            for frame_geo in tfn_geo:
+                v = frame_geo.get(geo_key)
+                if v is None:
+                    break
+                values.append(v)
+            if len(values) == len(tfn_geo) and len(values) > 0:
+                arr = np.array(values, dtype=float)
+                # Convert energy_kev back to eV for energy_energy field
+                if field == "energy_energy" and geo_key == "energy_kev":
+                    arr = arr * 1000.0
+                return arr
+
+    # 4. Baseline stream (efficient per-column path)
     val = _baseline_scalar(run, field)
     if val is not None:
         return np.array([float(val)], dtype=float)
 
-    # 3. Baseline via full xr.Dataset (legacy fallback)
+    # 5. Baseline via full xr.Dataset (legacy fallback)
     baseline = _read_baseline(run)
     val = _dataset_scalar(baseline, field)
     if val is not None:
         return np.array([float(val)], dtype=float)
 
-    # 4. Sample name parsing (last resort for waxs_arc)
-    if field == WAXS_ARC_FIELD:
+    # 6. Sample name parsing (last resort)
+    _SAMPLE_NAME_FIELD_MAP = {
+        WAXS_ARC_FIELD: "waxs_arc_deg",
+    }
+    if field in _SAMPLE_NAME_FIELD_MAP:
         start = run.metadata.get("start", {})
         name_geo = parse_sample_name_geometry(start.get("sample_name", ""))
-        arc_deg = name_geo.get("waxs_arc_deg")
-        if arc_deg is not None:
-            return np.array([arc_deg], dtype=float)
+        val = name_geo.get(_SAMPLE_NAME_FIELD_MAP[field])
+        if val is not None:
+            return np.array([float(val)], dtype=float)
 
     return None
 
@@ -1036,6 +1133,7 @@ def load_waxs_raw(
 
     arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD)
     bsx_values = _read_scan_axis(run, WAXS_BSX_FIELD)
+    energy_per_frame_ev = _read_scan_axis(run, "energy_energy")
 
     if images.ndim == 2:
         images = images[np.newaxis, :, :]
@@ -1059,6 +1157,14 @@ def load_waxs_raw(
         bsx_values = np.full(n_frames, bsx_values[0], dtype=float)
     elif bsx_values.shape[0] != n_frames:
         bsx_values = np.zeros(n_frames, dtype=float)
+
+    # Per-frame energy: expand scalar to array, or use geo default
+    if energy_per_frame_ev is None:
+        energy_per_frame_ev = np.full(n_frames, geo.energy_ev, dtype=float)
+    elif energy_per_frame_ev.shape[0] == 1 and n_frames > 1:
+        energy_per_frame_ev = np.full(n_frames, energy_per_frame_ev[0], dtype=float)
+    elif energy_per_frame_ev.shape[0] != n_frames:
+        energy_per_frame_ev = np.full(n_frames, geo.energy_ev, dtype=float)
 
     panels_attr = [
         {
@@ -1098,6 +1204,7 @@ def load_waxs_raw(
         "smi_rotation_k":            geo.rotation_k,
         "smi_panels":                panels_attr,
         "smi_waxs_bsx_per_frame":    bsx_values.tolist(),
+        "smi_energy_per_frame_ev":   energy_per_frame_ev.tolist(),
         "smi_incident_angle_deg":    incident_angle_deg,
         # Run identity
         "uid":         start.get("uid", ""),

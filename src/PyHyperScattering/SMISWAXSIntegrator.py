@@ -2097,15 +2097,22 @@ def integrate_waxs(
         dtype=float,
     )
 
+    # Per-frame energy (eV) — used for wavelength in q-map computation
+    energy_per_frame_ev = np.asarray(
+        attrs.get("smi_energy_per_frame_ev", [cal.energy_kev * 1000.0] * images.shape[0]),
+        dtype=float,
+    )
+
     img_0_rot, _ = rotate_image_and_mask(images[0], k=cal.rotation_k)
     rot_shape = img_0_rot.shape
 
-    def build_detector_for_angle(theta_deg: float):
+    def build_detector_for_angle(theta_deg: float, wavelength_nm: float | None = None):
         bc = cal.beam_center_at_angle(float(theta_deg))
+        wl = wavelength_nm if wavelength_nm is not None else cal.wavelength_nm
         return MultiPanelArcDetector(
             image_shape=rot_shape,
             panel_specs=cal.make_panel_specs(),
-            wavelength_nm=cal.wavelength_nm,
+            wavelength_nm=wl,
             pixel_size_mm=cal.pixel_size_mm,
             sample_distance_mm=cal.sample_distance_mm,
             beam_center_px=bc,
@@ -2125,9 +2132,15 @@ def integrate_waxs(
     else:
         _geo_cache = {}
 
-    for theta_val in arc_angles:
+    # Determine per-frame wavelength (nm) from energy
+    _HC_EV_NM = 1239.84198  # eV·nm
+    wavelength_per_frame_nm = _HC_EV_NM / energy_per_frame_ev
+
+    for fi, theta_val in enumerate(arc_angles):
         theta_f = float(theta_val)
-        key = round(theta_f, 6)
+        wl_nm = float(wavelength_per_frame_nm[fi])
+        # Cache key includes both arc angle and wavelength
+        key = (round(theta_f, 6), round(wl_nm, 8))
         if key in _geo_cache:
             # Still need q-range info even from cached entries
             qabs_px = _geo_cache[key][0]
@@ -2137,7 +2150,7 @@ def integrate_waxs(
                 _all_q_min.append(float(np.nanmin(qabs_px[finite])))
                 _all_q_max.append(float(np.nanmax(qabs_px[finite])))
             continue
-        det = build_detector_for_angle(theta_f)
+        det = build_detector_for_angle(theta_f, wavelength_nm=wl_nm)
         qds = det.qmap(theta_f)
         qx_px = cal.q_horizontal_sign * np.asarray(qds["qx"].values, dtype=float)
         qy_px = cal.q_vertical_sign * np.asarray(qds["qy"].values, dtype=float)
@@ -2176,6 +2189,7 @@ def integrate_waxs(
 
     for fi, theta in enumerate(arc_angles):
         theta_f = float(theta)
+        wl_nm = float(wavelength_per_frame_nm[fi])
         img_raw = images[fi]
         bsx = float(bsx_per_frame[fi]) if fi < len(bsx_per_frame) else 0.0
         img_rot, _ = rotate_image_and_mask(img_raw, k=cal.rotation_k)
@@ -2203,7 +2217,7 @@ def integrate_waxs(
             if mask_rot is not None:
                 mask_rot = np.fliplr(mask_rot)
 
-        geo_key = round(theta_f, 6)
+        geo_key = (round(theta_f, 6), round(wl_nm, 8))
         qabs_px, qx_px, qy_px, chi_px, sa_px = _geo_cache[geo_key]
 
         if solid_angle_correction:
@@ -2530,6 +2544,8 @@ def reduce_smi_combined(
         cal_dict: dict[str, Any] = dict(_DEFAULT_CAL)
         cal_dict["beam_center_row"] = waxs_geo.beam_center_row_px
         cal_dict["beam_center_col"] = waxs_geo.beam_center_col_px
+        cal_dict["energy_kev"] = waxs_geo.energy_ev / 1000.0
+        cal_dict["sample_distance_mm"] = waxs_geo.dist_m * 1000.0
         if waxs_beam_col_per_arc_deg != 0:
             cal_dict["beam_col_per_arc_deg"] = waxs_beam_col_per_arc_deg
         cal_override_keys = set(WAXSCalibration.__dataclass_fields__.keys())
