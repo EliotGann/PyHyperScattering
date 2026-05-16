@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import time
@@ -78,6 +79,319 @@ _WAXS_DEFAULT_BEAM_DELTA_COL_PX = -2.0        # additive correction to metadata 
 _WAXS_DEFAULT_PANEL_OFFSETS_DEG = (-7.0, 0.0, 7.0)
 _WAXS_DEFAULT_PANEL_COL_RANGES  = ((0, 206), (206, 413), (413, 619))
 _WAXS_ROTATION_K = 3                             # np.rot90 k-value
+
+
+# ---------------------------------------------------------------------------
+# HDF5 disk cache support (SMI Browser cache / self-populated cache)
+# ---------------------------------------------------------------------------
+#
+# Cache layout:
+#   /primary/<field>    — 1-D arrays of per-frame scalar values
+#   /baseline/<field>   — 1-D arrays (typically length 1–2)
+#   /images/<field>     — 3-D detector stacks (N, H, W)
+#   /reduction/         — (written by smi_browser, not used here)
+#
+# Reading functions return None when the requested data isn't cached,
+# letting callers fall back to tiled transparently.
+# ---------------------------------------------------------------------------
+
+def _auto_cache_path(uid: str) -> Path | None:
+    """Return the HDF5 cache path for *uid* if it exists on disk.
+
+    Checks ``$SMI_BROWSER_CACHE_DIR`` first, falling back to
+    ``$TMPDIR/smi_browser_cache/``.  Returns ``None`` if no cached file
+    is found.
+    """
+    import os
+    import tempfile
+
+    cache_dir = os.environ.get("SMI_BROWSER_CACHE_DIR")
+    if not cache_dir:
+        cache_dir = str(Path(tempfile.gettempdir()) / "smi_browser_cache")
+    p = Path(cache_dir) / f"{uid}.h5"
+    return p if p.exists() else None
+
+
+def _cache_dir() -> Path:
+    """Return the cache directory path (creating it if needed)."""
+    import os
+    import tempfile
+
+    cache_dir = os.environ.get("SMI_BROWSER_CACHE_DIR")
+    if not cache_dir:
+        cache_dir = str(Path(tempfile.gettempdir()) / "smi_browser_cache")
+    p = Path(cache_dir)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _read_cached_images(cache_path: str | Path, field: str) -> np.ndarray | None:
+    """Read an image stack from the disk cache.
+
+    Returns
+    -------
+    np.ndarray or None
+        Shape ``(N, H, W)`` if the field exists, else ``None``.
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with h5py.File(cache_path, "r") as f:
+            key = f"images/{field}"
+            if key not in f:
+                return None
+            return f[key][...]
+    except Exception:
+        return None
+
+
+def _read_cached_primary_field(cache_path: str | Path, field: str) -> np.ndarray | None:
+    """Read a single primary-stream field from the disk cache.
+
+    Returns
+    -------
+    np.ndarray or None
+        1-D array if the field exists, else ``None``.
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with h5py.File(cache_path, "r") as f:
+            key = f"primary/{field}"
+            if key not in f:
+                return None
+            return f[key][...]
+    except Exception:
+        return None
+
+
+def _read_cached_baseline(cache_path: str | Path) -> dict[str, np.ndarray] | None:
+    """Read the full baseline group from the disk cache.
+
+    Returns
+    -------
+    dict or None
+        Mapping of field name → 1-D numpy array, or ``None`` if the
+        baseline group does not exist in the cache.
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with h5py.File(cache_path, "r") as f:
+            if "baseline" not in f:
+                return None
+            grp = f["baseline"]
+            return {name: grp[name][...] for name in grp}
+    except Exception:
+        return None
+
+
+def _read_cached_baseline_field(cache_path: str | Path, field: str) -> np.ndarray | None:
+    """Read a single baseline field from the disk cache.
+
+    Returns
+    -------
+    np.ndarray or None
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with h5py.File(cache_path, "r") as f:
+            key = f"baseline/{field}"
+            if key not in f:
+                return None
+            return f[key][...]
+    except Exception:
+        return None
+
+
+def populate_cache(
+    uid: str,
+    run: Any,
+    cache_path: str | Path | None = None,
+    include_images: bool = True,
+) -> Path:
+    """Populate the HDF5 disk cache for a run from tiled data.
+
+    This fetches primary scalars, baseline scalars, and (optionally) raw
+    detector images from tiled and writes them into a single HDF5 file.
+    Subsequent reduction calls with the same UID will read from the cache
+    instead of making HTTP round-trips.
+
+    Parameters
+    ----------
+    uid : str
+        Run UID.
+    run : tiled run object
+        An already-connected tiled run (e.g. from ``client[catalog/uid]``).
+    cache_path : str, Path, or None
+        Explicit path for the cache file.  If ``None``, uses the default
+        location (``$SMI_BROWSER_CACHE_DIR/<uid>.h5`` or
+        ``$TMPDIR/smi_browser_cache/<uid>.h5``).
+    include_images : bool
+        If True (default), also cache raw detector image stacks.  Set to
+        False if you only want scalar metadata cached (much faster).
+
+    Returns
+    -------
+    Path
+        The path to the written cache file.
+    """
+    import h5py
+
+    if cache_path is None:
+        cache_path = _cache_dir() / f"{uid}.h5"
+    else:
+        cache_path = Path(cache_path)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with h5py.File(cache_path, "a") as f:
+        # --- Primary scalars ---
+        if "primary" not in f:
+            f.create_group("primary")
+        primary_grp = f["primary"]
+
+        # Read scalar fields from primary/internal (non-image columns)
+        _primary_fields = _get_primary_scalar_fields(run)
+        for field_name, arr in _primary_fields.items():
+            if field_name not in primary_grp:
+                primary_grp.create_dataset(field_name, data=arr)
+
+        # --- Baseline ---
+        if "baseline" not in f:
+            f.create_group("baseline")
+        baseline_grp = f["baseline"]
+
+        baseline_ds = _read_baseline(run)
+        if baseline_ds is not None:
+            for var_name in baseline_ds.data_vars:
+                if var_name not in baseline_grp:
+                    try:
+                        arr = np.asarray(baseline_ds[var_name].values)
+                        if arr.dtype.kind in ("f", "i", "u"):
+                            baseline_grp.create_dataset(var_name, data=arr)
+                    except Exception:
+                        pass
+
+        # --- Images ---
+        if include_images:
+            if "images" not in f:
+                f.create_group("images")
+            images_grp = f["images"]
+
+            for field in (SAXS_IMAGE_FIELD, WAXS_IMAGE_FIELD):
+                if field in images_grp:
+                    continue  # already cached
+                if _has_primary_field(run, field):
+                    try:
+                        arr = _read_primary_field(run, field)
+                        if arr is not None and arr.ndim >= 2:
+                            if arr.ndim == 2:
+                                arr = arr[np.newaxis, :, :]
+                            images_grp.create_dataset(
+                                field,
+                                data=arr,
+                                chunks=(1, arr.shape[1], arr.shape[2]),
+                                compression="gzip",
+                                compression_opts=2,
+                            )
+                    except Exception:
+                        pass
+
+    return cache_path
+
+
+def _get_primary_scalar_fields(run: Any) -> dict[str, np.ndarray]:
+    """Read all non-image scalar fields from primary into a dict.
+
+    This is used for cache population — it reads per-frame 1-D arrays
+    for motors/signals that live alongside detector images in the primary
+    stream.
+    """
+    results: dict[str, np.ndarray] = {}
+    _IMAGE_FIELDS = {SAXS_IMAGE_FIELD, WAXS_IMAGE_FIELD}
+
+    try:
+        primary = run["primary"]
+    except Exception:
+        return results
+
+    # Try modern layout: primary/data/<field>
+    field_container = None
+    try:
+        field_container = primary["data"]
+    except Exception:
+        pass
+    if field_container is None:
+        # Old layout: primary itself is the container
+        field_container = primary
+
+    try:
+        field_names = list(field_container)
+    except Exception:
+        return results
+
+    for name in field_names:
+        if name in _IMAGE_FIELDS:
+            continue
+        try:
+            node = field_container[name]
+            raw = node.read() if hasattr(node, "read") else node[...]
+            arr = np.asarray(raw)
+            # Only cache numeric 1-D arrays (scalars per frame)
+            if arr.ndim <= 1 and arr.dtype.kind in ("f", "i", "u"):
+                results[name] = arr.ravel()
+        except Exception:
+            continue
+
+    return results
+
+
+def _prepopulate_caches_from_h5(run: Any, cache_path: str | Path) -> None:
+    """Pre-populate module-level baseline/primary caches from an HDF5 file.
+
+    This fills ``_BASELINE_CACHE`` with an xr.Dataset built from the
+    ``/baseline`` group, so that all subsequent ``_baseline_scalar()`` calls
+    within this run hit the in-memory cache instead of tiled.
+    """
+    _rid = _run_uid(run)
+
+    # --- Baseline ---
+    if _rid not in _BASELINE_CACHE:
+        baseline_dict = _read_cached_baseline(cache_path)
+        if baseline_dict is not None:
+            ds = xr.Dataset(
+                {k: xr.DataArray(v) for k, v in baseline_dict.items()}
+            )
+            _BASELINE_CACHE[_rid] = ds
 
 
 # ---------------------------------------------------------------------------
@@ -935,10 +1249,11 @@ def _has_primary_field(run: Any, field: str) -> bool:
         return False
 
 
-def _read_scan_axis(run: Any, field: str) -> np.ndarray | None:
+def _read_scan_axis(run: Any, field: str, cache_path: str | Path | None = None) -> np.ndarray | None:
     """Read a motor field from primary; fall back to other sources if absent.
 
     Fallback order:
+      0. HDF5 disk cache (if cache_path provided and field is present)
       1. Primary stream data fields (per-frame values — when motor is scanned)
       2. Primary/internal stream (per-frame values from non-scanned signals)
       3. target_file_name parsing from primary/internal (per-frame encoded)
@@ -949,6 +1264,15 @@ def _read_scan_axis(run: Any, field: str) -> np.ndarray | None:
     Reads only the requested field directly from tiled (avoids pulling the
     full primary stream, which contains the multi-GB detector arrays).
     """
+    # 0. HDF5 disk cache
+    if cache_path is not None:
+        cached = _read_cached_primary_field(cache_path, field)
+        if cached is not None:
+            try:
+                return np.asarray(cached, dtype=float)
+            except (ValueError, TypeError):
+                pass
+
     # 1. Primary stream data fields (per-frame varying values)
     if _has_primary_field(run, field):
         try:
@@ -1023,9 +1347,16 @@ def load_saxs_raw(
     run: Any,
     geo: SAXSGeometry,
     extra_attrs: dict[str, Any] | None = None,
+    image_cache_path: str | Path | None = None,
 ) -> xr.DataArray:
     """
     Load SAXS (Pilatus 2M) raw images from a tiled run as an xr.DataArray.
+
+    Parameters
+    ----------
+    image_cache_path : str, Path, or None
+        If given, attempt to read images from this HDF5 cache file before
+        falling back to tiled.
 
     Returns
     -------
@@ -1033,7 +1364,19 @@ def load_saxs_raw(
         dims: (frame, pix_y, pix_x)  or (pix_y, pix_x) if single frame.
         attrs: PyHyperScattering-compatible geometry + SMI-specific extras.
     """
-    images = _read_primary_field(run, SAXS_IMAGE_FIELD)
+    images = None
+    _t_img = time.perf_counter()
+    if image_cache_path is not None:
+        images = _read_cached_images(image_cache_path, SAXS_IMAGE_FIELD)
+    if images is not None:
+        _dt = time.perf_counter() - _t_img
+        print(f"[SMILoader] SAXS images loaded from cache in {_dt:.3f}s "
+              f"(shape={images.shape})")
+    else:
+        images = _read_primary_field(run, SAXS_IMAGE_FIELD)
+        _dt = time.perf_counter() - _t_img
+        print(f"[SMILoader] SAXS images loaded from tiled in {_dt:.3f}s "
+              f"(shape={images.shape})")
     start = run.metadata.get("start", {})
     sample_name = start.get("sample_name", "")
     name_geo = parse_sample_name_geometry(sample_name)
@@ -1083,7 +1426,7 @@ def load_saxs_raw(
             f"with shape {images.shape}"
         )
     n_frames = images.shape[0]
-    arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD)
+    arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD, cache_path=image_cache_path)
     if arc_angles is not None and arc_angles.shape[0] == n_frames:
         frame_coord = arc_angles
         frame_dim_name = WAXS_ARC_FIELD
@@ -1107,9 +1450,16 @@ def load_waxs_raw(
     run: Any,
     geo: WAXSGeometry,
     extra_attrs: dict[str, Any] | None = None,
+    image_cache_path: str | Path | None = None,
 ) -> xr.DataArray:
     """
     Load WAXS (900KW) raw images from a tiled run as an xr.DataArray.
+
+    Parameters
+    ----------
+    image_cache_path : str, Path, or None
+        If given, attempt to read images from this HDF5 cache file before
+        falling back to tiled.
 
     Returns
     -------
@@ -1118,7 +1468,19 @@ def load_waxs_raw(
         coords: waxs_arc — arc motor angles in degrees
         attrs: PyHyperScattering-compatible + SMI WAXS panel geometry
     """
-    images = _read_primary_field(run, WAXS_IMAGE_FIELD)
+    images = None
+    _t_img = time.perf_counter()
+    if image_cache_path is not None:
+        images = _read_cached_images(image_cache_path, WAXS_IMAGE_FIELD)
+    if images is not None:
+        _dt = time.perf_counter() - _t_img
+        print(f"[SMILoader] WAXS images loaded from cache in {_dt:.3f}s "
+              f"(shape={images.shape})")
+    else:
+        images = _read_primary_field(run, WAXS_IMAGE_FIELD)
+        _dt = time.perf_counter() - _t_img
+        print(f"[SMILoader] WAXS images loaded from tiled in {_dt:.3f}s "
+              f"(shape={images.shape})")
     start  = run.metadata.get("start", {})
     sample_name = start.get("sample_name", "")
     name_geo = parse_sample_name_geometry(sample_name)
@@ -1131,9 +1493,9 @@ def load_waxs_raw(
         or name_geo.get("theta_deg")
     )
 
-    arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD)
-    bsx_values = _read_scan_axis(run, WAXS_BSX_FIELD)
-    energy_per_frame_ev = _read_scan_axis(run, "energy_energy")
+    arc_angles = _read_scan_axis(run, WAXS_ARC_FIELD, cache_path=image_cache_path)
+    bsx_values = _read_scan_axis(run, WAXS_BSX_FIELD, cache_path=image_cache_path)
+    energy_per_frame_ev = _read_scan_axis(run, "energy_energy", cache_path=image_cache_path)
 
     if images.ndim == 2:
         images = images[np.newaxis, :, :]
@@ -1492,6 +1854,7 @@ class TiledSMISWAXSLoader:
         detector: str = "saxs",
         geo_overrides: dict[str, Any] | None = None,
         extra_attrs: dict[str, Any] | None = None,
+        image_cache_path: str | Path | None = None,
     ) -> xr.DataArray | None:
         """
         Load raw images for one run.
@@ -1506,6 +1869,9 @@ class TiledSMISWAXSLoader:
             Override specific geometry parameters.
         extra_attrs : dict | None
             Extra attrs to attach to the returned DataArray.
+        image_cache_path : str, Path, or None
+            If given, attempt to read images from this HDF5 cache file
+            before falling back to tiled.
 
         Returns
         -------
@@ -1517,13 +1883,18 @@ class TiledSMISWAXSLoader:
         run = self._get_run(uid)
         overrides = dict(geo_overrides or {})
 
+        # Pre-populate baseline cache from HDF5 if available — avoids
+        # tiled round-trips in resolve_*_geometry and load_*_raw.
+        if image_cache_path is not None:
+            _prepopulate_caches_from_h5(run, image_cache_path)
+
         if detector == "saxs":
             if not _has_primary_field(run, SAXS_IMAGE_FIELD):
                 return None
             geo = resolve_saxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
-            return load_saxs_raw(run, geo, extra_attrs=extra_attrs)
+            return load_saxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
 
         if detector == "waxs":
             if not _has_primary_field(run, WAXS_IMAGE_FIELD):
@@ -1531,7 +1902,7 @@ class TiledSMISWAXSLoader:
             geo = resolve_waxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
-            return load_waxs_raw(run, geo, extra_attrs=extra_attrs)
+            return load_waxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
 
         raise ValueError(
             f"Unknown detector '{detector}'. Expected 'saxs' or 'waxs'."

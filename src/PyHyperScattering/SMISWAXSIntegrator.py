@@ -1847,6 +1847,8 @@ def reduce_smi_gi(
     dezinger_threshold: float | None = 30000.0,
     dezinger_kernel: int = 5,
     waxs_cal_overrides: dict[str, Any] | None = None,
+    image_cache_path: str | Path | None = "auto",
+    populate_disk_cache: bool = True,
 ) -> GIReductionResult:
     """Full grazing-incidence WAXS reduction pipeline.
 
@@ -1876,6 +1878,15 @@ def reduce_smi_gi(
         Hot-pixel rejection parameters.
     waxs_cal_overrides : dict or None
         Extra overrides for ``WAXSCalibration`` fields.
+    image_cache_path : str, Path, None, or "auto"
+        Path to a pre-cached HDF5 image file (SMI Browser disk cache).
+        If ``"auto"`` (default), automatically checks
+        ``$SMI_BROWSER_CACHE_DIR/<uid>.h5``.  If a cache file is found,
+        images are read from it instead of tiled; missing fields fall back
+        to tiled transparently.  Pass ``None`` to disable cache lookup.
+    populate_disk_cache : bool
+        If True (default) and no cache file existed, write fetched data
+        to the cache after loading from tiled.
 
     Returns
     -------
@@ -1884,10 +1895,24 @@ def reduce_smi_gi(
     import time as _time
     from PyHyperScattering.SMISWAXSLoader import (
         TiledSMISWAXSLoader,
+        _auto_cache_path,
+        populate_cache,
         resolve_waxs_geometry,
     )
 
     t0 = _time.perf_counter()
+
+    # Resolve image cache path
+    _cache_was_missing = False
+    if image_cache_path == "auto":
+        image_cache_path = _auto_cache_path(uid)
+        if image_cache_path is None:
+            _cache_was_missing = True
+    elif image_cache_path is not None:
+        image_cache_path = Path(image_cache_path) if not isinstance(image_cache_path, Path) else image_cache_path
+        if not image_cache_path.exists():
+            _cache_was_missing = True
+            image_cache_path = None
 
     # --- Connect & get metadata ---
     from tiled.client import from_uri
@@ -1918,10 +1943,17 @@ def reduce_smi_gi(
 
     # --- Load WAXS images ---
     loader = TiledSMISWAXSLoader(tiled_uri=tiled_uri, catalog=catalog)
-    waxs_raw = loader.loadSingleImage(uid, detector="waxs")
+    waxs_raw = loader.loadSingleImage(uid, detector="waxs", image_cache_path=image_cache_path)
     if waxs_raw is None:
         raise RuntimeError(f"No WAXS data in scan {uid}")
     t_load = _time.perf_counter()
+
+    # Populate disk cache for future runs if data was fetched from tiled
+    if populate_disk_cache and _cache_was_missing:
+        try:
+            populate_cache(uid, run, include_images=True)
+        except Exception:
+            pass  # cache write is best-effort
 
     # --- Mask ---
     from PyHyperScattering.smi_defaults import resolve_mask_path
@@ -2429,6 +2461,8 @@ def reduce_smi_combined(
     waxs_beam_col_per_arc_deg: float = 0.0,
     cache_geometry: bool = True,
     pixel_splitting: int = 1,
+    image_cache_path: str | Path | None = "auto",
+    populate_disk_cache: bool = True,
 ) -> CombinedReductionResult:
     """
     Full SAXS + WAXS reduction pipeline.
@@ -2493,6 +2527,18 @@ def reduce_smi_combined(
         pixel into an NxN grid and distribute intensity fractionally across
         bins using gradient-based interpolation of the q/chi maps.  Typical
         values are 2–4.
+    image_cache_path : str, Path, None, or "auto"
+        Path to a pre-cached HDF5 image file (SMI Browser disk cache).
+        If ``"auto"`` (default), automatically checks
+        ``$SMI_BROWSER_CACHE_DIR/<uid>.h5`` (or ``$TMPDIR/smi_browser_cache/``).
+        If a cache file is found, images are read from it instead of tiled;
+        any missing detector fields fall back to tiled transparently.
+        Pass ``None`` to disable cache lookup entirely.
+    populate_disk_cache : bool
+        If True (default) and the cache file does not already exist, write
+        the fetched images, primary scalars, and baseline to a new HDF5
+        cache file after loading from tiled.  This speeds up subsequent
+        reductions of the same scan (e.g. with different parameters).
 
     Returns
     -------
@@ -2501,8 +2547,11 @@ def reduce_smi_combined(
     import time as _time
     from PyHyperScattering.SMISWAXSLoader import (
         TiledSMISWAXSLoader,
+        _auto_cache_path,
+        _cache_dir,
         clear_baseline_cache,
         infer_detectors_and_steps,
+        populate_cache,
         resolve_saxs_geometry,
         resolve_waxs_geometry,
     )
@@ -2511,6 +2560,18 @@ def reduce_smi_combined(
     waxs_kw = dict(waxs_kwargs or {})
     opts = dict(backend_options or {})
     t0 = _time.perf_counter()
+
+    # Resolve image cache path
+    _cache_was_missing = False
+    if image_cache_path == "auto":
+        image_cache_path = _auto_cache_path(uid)
+        if image_cache_path is None:
+            _cache_was_missing = True
+    elif image_cache_path is not None:
+        image_cache_path = Path(image_cache_path) if not isinstance(image_cache_path, Path) else image_cache_path
+        if not image_cache_path.exists():
+            _cache_was_missing = True
+            image_cache_path = None
 
     # Load raw data — reuse a single loader (and its tiled session) for
     # everything so we don't call from_uri / authenticate twice.
@@ -2523,11 +2584,18 @@ def reduce_smi_combined(
     # introspects the tiled containers directly.
     scan_info = infer_detectors_and_steps(run, None)
 
-    saxs_raw = loader.loadSingleImage(uid, detector="saxs")
-    waxs_raw = loader.loadSingleImage(uid, detector="waxs")
+    saxs_raw = loader.loadSingleImage(uid, detector="saxs", image_cache_path=image_cache_path)
+    waxs_raw = loader.loadSingleImage(uid, detector="waxs", image_cache_path=image_cache_path)
     has_saxs = saxs_raw is not None
     has_waxs = waxs_raw is not None
     t_load = _time.perf_counter()
+
+    # Populate disk cache for future runs if data was fetched from tiled
+    if populate_disk_cache and _cache_was_missing:
+        try:
+            populate_cache(uid, run, include_images=True)
+        except Exception:
+            pass  # cache write is best-effort
 
     # -- SAXS branch --
     saxs_result: dict[str, Any] | None = None
