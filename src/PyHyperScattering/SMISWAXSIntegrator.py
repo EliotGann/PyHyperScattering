@@ -2575,17 +2575,35 @@ def reduce_smi_combined(
 
     # Load raw data — reuse a single loader (and its tiled session) for
     # everything so we don't call from_uri / authenticate twice.
+    _t_debug = _time.perf_counter()
     loader = TiledSMISWAXSLoader(tiled_uri=tiled_uri, catalog=catalog)
+    print(f"[reduce_smi_combined] TiledSMISWAXSLoader init: "
+          f"{_time.perf_counter() - _t_debug:.3f}s")
+
+    _t_debug = _time.perf_counter()
     run = loader._get_run(uid)
+    print(f"[reduce_smi_combined] _get_run: "
+          f"{_time.perf_counter() - _t_debug:.3f}s")
 
     # Avoid run["primary"].read() — that pulls every variable in the primary
     # stream including the multi-frame detector arrays, which can trigger
     # an HTTP 500 from the tiled backend.  infer_detectors_and_steps now
     # introspects the tiled containers directly.
-    scan_info = infer_detectors_and_steps(run, None)
+    _t_debug = _time.perf_counter()
+    scan_info = infer_detectors_and_steps(run, None, cache_path=image_cache_path)
+    print(f"[reduce_smi_combined] infer_detectors_and_steps: "
+          f"{_time.perf_counter() - _t_debug:.3f}s")
 
+    _t_debug = _time.perf_counter()
     saxs_raw = loader.loadSingleImage(uid, detector="saxs", image_cache_path=image_cache_path)
+    print(f"[reduce_smi_combined] loadSingleImage(saxs): "
+          f"{_time.perf_counter() - _t_debug:.3f}s")
+
+    _t_debug = _time.perf_counter()
     waxs_raw = loader.loadSingleImage(uid, detector="waxs", image_cache_path=image_cache_path)
+    print(f"[reduce_smi_combined] loadSingleImage(waxs): "
+          f"{_time.perf_counter() - _t_debug:.3f}s")
+
     has_saxs = saxs_raw is not None
     has_waxs = waxs_raw is not None
     t_load = _time.perf_counter()

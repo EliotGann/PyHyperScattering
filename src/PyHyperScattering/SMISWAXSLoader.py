@@ -1588,8 +1588,107 @@ def load_waxs_raw(
 # Scan info utility
 # ---------------------------------------------------------------------------
 
+def _infer_from_cache(cache_path: str | Path, start: dict) -> dict[str, Any] | None:
+    """Fast path for infer_detectors_and_steps using the HDF5 disk cache.
+
+    Returns the same dict that infer_detectors_and_steps would return,
+    or None if the cache doesn't have enough info.
+    """
+    try:
+        import h5py
+    except ImportError:
+        return None
+
+    cache_path = Path(cache_path)
+    if not cache_path.exists():
+        return None
+
+    try:
+        with h5py.File(cache_path, "r") as f:
+            # Collect field names from /primary and /images
+            primary_fields: list[str] = []
+            if "primary" in f:
+                primary_fields = sorted(f["primary"].keys())
+
+            image_fields: list[str] = []
+            if "images" in f:
+                image_fields = sorted(f["images"].keys())
+
+            # Build vars_all: primary scalars + image field names
+            vars_all = sorted(set(primary_fields) | set(image_fields))
+
+            # Determine n_frames from image datasets or primary arrays
+            n_frames = 0
+            for img_name in image_fields:
+                ds = f[f"images/{img_name}"]
+                if ds.ndim >= 1:
+                    n_frames = int(ds.shape[0])
+                    break
+            if n_frames == 0:
+                for pf in primary_fields:
+                    ds = f[f"primary/{pf}"]
+                    if ds.ndim == 1 and ds.shape[0] > 0:
+                        n_frames = int(ds.shape[0])
+                        break
+
+            # Build step_candidates from 1-D primary fields
+            step_candidates: list[dict[str, Any]] = []
+            for name in primary_fields:
+                ds = f[f"primary/{name}"]
+                if ds.ndim != 1:
+                    continue
+                if int(ds.shape[0]) != n_frames:
+                    continue
+                try:
+                    values = np.asarray(ds[...], dtype=float)
+                except (ValueError, TypeError):
+                    continue
+                finite = values[np.isfinite(values)]
+                unique = np.unique(finite)
+                if unique.size <= 1:
+                    continue
+                step_candidates.append(
+                    {
+                        "name": name,
+                        "n_unique": int(unique.size),
+                        "min": float(np.nanmin(values)),
+                        "max": float(np.nanmax(values)),
+                        "values": values,
+                    }
+                )
+    except Exception:
+        return None
+
+    detector_prefixes = sorted(
+        {name.split("_")[0] for name in vars_all if "_" in name}
+    )
+
+    print(f"[infer_detectors_and_steps] used HDF5 cache "
+          f"({len(primary_fields)} primary fields, "
+          f"{len(image_fields)} image fields)")
+
+    return {
+        "uid": start.get("uid"),
+        "scan_id": start.get("scan_id"),
+        "sample_name": start.get("sample_name"),
+        "n_frames": n_frames,
+        "detectors_start": start.get("detectors", []) or [],
+        "detector_prefixes_in_primary": detector_prefixes,
+        "step_candidates": step_candidates,
+        "detector_fields": {
+            "saxs": [n for n in vars_all if n.startswith("pil2M_")],
+            "waxs": [n for n in vars_all if n.startswith("pil900KW_")],
+            "scan_axes": [
+                n for n in vars_all
+                if n in {"waxs_arc", "waxs_bsx", "waxs_bsy"}
+            ],
+        },
+    }
+
+
 def infer_detectors_and_steps(
     run: Any, primary: xr.Dataset | None = None,
+    cache_path: str | Path | None = None,
 ) -> dict[str, Any]:
     """Inspect a tiled run to determine detectors, scan axes, and frame count.
 
@@ -1604,8 +1703,17 @@ def infer_detectors_and_steps(
         ``.read()`` on the detector image fields — only field names, shapes,
         and 1-D scan axes are fetched, which avoids the multi-GB request that
         can trigger an HTTP 500 from the tiled backend.
+    cache_path : str, Path, or None
+        If given, read primary scalar fields from this HDF5 cache file
+        instead of making tiled HTTP calls.
     """
     start = run.metadata.get("start", {})
+
+    # --- Fast path: read from HDF5 disk cache ---
+    if cache_path is not None and primary is None:
+        _cache_result = _infer_from_cache(cache_path, start)
+        if _cache_result is not None:
+            return _cache_result
 
     if primary is not None:
         vars_all = sorted(map(str, primary.data_vars.keys()))
@@ -1643,6 +1751,7 @@ def infer_detectors_and_steps(
             )
     else:
         # Tiled-introspection path — no bulk reads of detector arrays.
+        _t_ids = time.perf_counter()
         try:
             primary_node = run["primary"]
         except Exception:
@@ -1663,6 +1772,8 @@ def infer_detectors_and_steps(
                 vars_all = sorted(map(str, list(field_container)))
             except Exception:
                 vars_all = []
+        print(f"[infer_detectors_and_steps] list fields ({len(vars_all)}): "
+              f"{time.perf_counter() - _t_ids:.3f}s")
 
         def _shape_of(name: str) -> tuple[int, ...]:
             try:
@@ -1679,16 +1790,23 @@ def infer_detectors_and_steps(
 
         # Determine n_frames from the first array-like field with a
         # leading dimension.  Avoids reading detector data.
+        _t_ids = time.perf_counter()
         n_frames = 0
         for name in vars_all:
             shp = _shape_of(name)
             if shp:
                 n_frames = int(shp[0])
                 break
+        print(f"[infer_detectors_and_steps] n_frames detection: "
+              f"{time.perf_counter() - _t_ids:.3f}s")
 
+        _t_ids = time.perf_counter()
+        _n_shape_checks = 0
+        _n_reads = 0
         step_candidates: list[dict[str, Any]] = []
         for name in vars_all:
             shp = _shape_of(name)
+            _n_shape_checks += 1
             if len(shp) != 1 or shp[0] != n_frames:
                 continue
             try:
@@ -1697,6 +1815,7 @@ def infer_detectors_and_steps(
                     node.read() if hasattr(node, "read") else node[...],
                     dtype=float,
                 )
+                _n_reads += 1
             except Exception:
                 continue
             finite = values[np.isfinite(values)]
@@ -1712,6 +1831,9 @@ def infer_detectors_and_steps(
                     "values": values,
                 }
             )
+        print(f"[infer_detectors_and_steps] step_candidates loop "
+              f"({_n_shape_checks} shape checks, {_n_reads} reads): "
+              f"{time.perf_counter() - _t_ids:.3f}s")
 
     detector_prefixes = sorted(
         {name.split("_")[0] for name in vars_all if "_" in name}
@@ -1885,24 +2007,47 @@ class TiledSMISWAXSLoader:
 
         # Pre-populate baseline cache from HDF5 if available — avoids
         # tiled round-trips in resolve_*_geometry and load_*_raw.
+        _t = time.perf_counter()
         if image_cache_path is not None:
             _prepopulate_caches_from_h5(run, image_cache_path)
+        print(f"[loadSingleImage({detector})] prepopulate_caches: "
+              f"{time.perf_counter() - _t:.3f}s")
 
         if detector == "saxs":
+            _t = time.perf_counter()
             if not _has_primary_field(run, SAXS_IMAGE_FIELD):
                 return None
+            print(f"[loadSingleImage(saxs)] _has_primary_field check: "
+                  f"{time.perf_counter() - _t:.3f}s")
+            _t = time.perf_counter()
             geo = resolve_saxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
-            return load_saxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
+            print(f"[loadSingleImage(saxs)] resolve_saxs_geometry: "
+                  f"{time.perf_counter() - _t:.3f}s")
+            _t = time.perf_counter()
+            result = load_saxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
+            print(f"[loadSingleImage(saxs)] load_saxs_raw: "
+                  f"{time.perf_counter() - _t:.3f}s")
+            return result
 
         if detector == "waxs":
+            _t = time.perf_counter()
             if not _has_primary_field(run, WAXS_IMAGE_FIELD):
                 return None
+            print(f"[loadSingleImage(waxs)] _has_primary_field check: "
+                  f"{time.perf_counter() - _t:.3f}s")
+            _t = time.perf_counter()
             geo = resolve_waxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
-            return load_waxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
+            print(f"[loadSingleImage(waxs)] resolve_waxs_geometry: "
+                  f"{time.perf_counter() - _t:.3f}s")
+            _t = time.perf_counter()
+            result = load_waxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
+            print(f"[loadSingleImage(waxs)] load_waxs_raw: "
+                  f"{time.perf_counter() - _t:.3f}s")
+            return result
 
         raise ValueError(
             f"Unknown detector '{detector}'. Expected 'saxs' or 'waxs'."
