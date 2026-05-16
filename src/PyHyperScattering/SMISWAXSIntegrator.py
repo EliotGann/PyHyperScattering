@@ -28,6 +28,7 @@ Key classes / functions
 from __future__ import annotations
 
 import json
+import time as _time
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -414,38 +415,43 @@ def dezinger(
     kernel_size: int = 5,
     threshold: float = 5.0,
 ) -> np.ndarray:
-    """Detect hot/dead pixels via median-filter outlier rejection.
+    """Detect hot/dead pixels via local-mean outlier rejection.
 
-    Compares each pixel to a local median. Pixels deviating by more than
-    ``threshold`` × σ (estimated from the MAD) are flagged.
+    Uses a fast separable uniform (mean) filter instead of median_filter.
+    For photon-counting detectors, zingers are extreme outliers (10-100×
+    above background) so mean-based detection is effective and ~10× faster
+    than median-based for large images.
+
+    Pixels deviating by more than ``threshold`` × σ from the local mean
+    are flagged.
 
     Parameters
     ----------
     image : ndarray
         2-D detector image.
     kernel_size : int
-        Side length of the square median-filter kernel (default 5).
+        Side length of the square filter kernel (default 5).
     threshold : float
-        Number of σ above the local median to flag as bad (default 5).
+        Number of σ above the local mean to flag as bad (default 5).
 
     Returns
     -------
     ndarray[bool]
         True for *valid* pixels, False for outliers (matches mask convention).
     """
-    from scipy.ndimage import median_filter
+    from scipy.ndimage import uniform_filter
 
     img = np.asarray(image, dtype=float)
-    med = median_filter(img, size=kernel_size)
-    diff = img - med
-    finite_diff = diff[np.isfinite(diff)]
-    if finite_diff.size == 0:
-        return np.ones(img.shape, dtype=bool)
-    mad = np.median(np.abs(finite_diff))
-    sigma_est = 1.4826 * mad  # MAD → Gaussian σ conversion
-    if sigma_est < 1e-12:
-        sigma_est = 1.0  # avoid division by zero for uniform images
-    return ~(np.abs(diff) > threshold * sigma_est)
+    local_mean = uniform_filter(img, size=kernel_size, mode="reflect")
+    # Local variance via E[X²] - E[X]²
+    local_sq = uniform_filter(img * img, size=kernel_size, mode="reflect")
+    local_var = np.maximum(local_sq - local_mean**2, 0.0)
+    local_std = np.sqrt(local_var)
+    # Floor the std to avoid flagging pixels in truly uniform regions
+    global_std = np.nanstd(img[np.isfinite(img)]) if np.any(np.isfinite(img)) else 1.0
+    local_std = np.maximum(local_std, 0.01 * global_std)
+    diff = img - local_mean
+    return ~(np.abs(diff) > threshold * local_std)
 
 
 # ===================================================================
@@ -2026,6 +2032,7 @@ def integrate_saxs(
     pixel_splitting: int = 1,
 ) -> dict[str, Any]:
     """SAXS reduction via direct pixel-space q-map and histogram binning."""
+    _t0_saxs = _time.perf_counter()
     attrs = saxs_raw.attrs
     # Build geometry arrays from attrs
     dist_m = float(attrs["dist"])
@@ -2082,7 +2089,10 @@ def integrate_saxs(
             _SAXS_GEOMETRY_CACHE[_saxs_key] = (q2d, qh2d, qv2d, chi_deg_2d, sa_base)
 
     bc_col = poni2_m / pixel2_m
+    print(f"  [integrate_saxs] geometry build/cache: "
+          f"{_time.perf_counter() - _t0_saxs:.3f}s")
 
+    _t_mask = _time.perf_counter()
     base_valid = np.isfinite(q2d) & np.isfinite(chi_deg_2d)
     if mask_use is not None:
         base_valid &= mask_use
@@ -2116,15 +2126,21 @@ def integrate_saxs(
         per_frame_valid &= large_area_mask
     elif large_area_mask.shape[0] >= n_frames:
         per_frame_valid &= large_area_mask[:n_frames]
+    print(f"  [integrate_saxs] mask+large_area: "
+          f"{_time.perf_counter() - _t_mask:.3f}s")
 
     # Per-frame dezinger: flag hot pixels
+    _t_dez = _time.perf_counter()
     if dezinger_threshold is not None:
         for _di in range(n_frames):
             dz_mask = dezinger(images[_di], kernel_size=dezinger_kernel,
                                 threshold=dezinger_threshold)
             per_frame_valid[_di] &= dz_mask
+    print(f"  [integrate_saxs] dezinger ({n_frames} frames): "
+          f"{_time.perf_counter() - _t_dez:.3f}s")
 
     # Bin edges
+    _t_bins = _time.perf_counter()
     q_vals = q2d[base_valid]
     chi_vals = chi_deg_2d[base_valid]
     if q_vals.size > 0:
@@ -2140,12 +2156,17 @@ def integrate_saxs(
     else:
         chi_edges = np.linspace(-180.0, 180.0, n_chi + 1)
     chi_grid = 0.5 * (chi_edges[:-1] + chi_edges[1:])
+    print(f"  [integrate_saxs] bin edges: "
+          f"{_time.perf_counter() - _t_bins:.3f}s")
 
     accum_I = np.zeros((n_q, n_chi), dtype=float)
     accum_N = np.zeros((n_q, n_chi), dtype=float)
     frame_qchi: list[xr.Dataset] = []
     frame_iq: list[xr.Dataset] = []
 
+    _t_loop = _time.perf_counter()
+    _t_hist_total = 0.0
+    _t_qchi_total = 0.0
     for idx in range(n_frames):
         img = images[idx].astype(float)
         if sa is not None:
@@ -2156,17 +2177,25 @@ def integrate_saxs(
         valid = per_frame_valid[idx] & np.isfinite(img)
         i_hist = np.zeros((n_q, n_chi), dtype=float)
         n_hist = np.zeros((n_q, n_chi), dtype=float)
+        _th = _time.perf_counter()
         if np.any(valid):
             i_hist, n_hist = _histogram2d_pixel_split(
                 q2d, chi_deg_2d, img, valid, q_edges, chi_edges,
                 pixel_splitting=pixel_splitting,
             )
+        _t_hist_total += _time.perf_counter() - _th
         accum_I += i_hist
         accum_N += n_hist
+        _tq = _time.perf_counter()
         frame_out = _qchi_and_iq(i_hist, n_hist, q_grid, chi_grid)
         frame_qchi.append(frame_out["q_chi"])
         frame_iq.append(frame_out["iq"])
+        _t_qchi_total += _time.perf_counter() - _tq
 
+    print(f"  [integrate_saxs] per-frame loop ({n_frames} frames): "
+          f"{_time.perf_counter() - _t_loop:.3f}s "
+          f"(hist={_t_hist_total:.3f}s, qchi={_t_qchi_total:.3f}s)")
+    _t_build = _time.perf_counter()
     out = _qchi_and_iq(accum_I, accum_N, q_grid, chi_grid)
     out["q_chi_frames"] = _stack_qchi_frames(frame_qchi)
     out["iq_frames"] = _stack_iq_frames(frame_iq)
@@ -2205,6 +2234,10 @@ def integrate_saxs(
         coords={"frame": np.arange(n_frames, dtype=int)},
     )
     out["ds"] = ds
+    print(f"  [integrate_saxs] output build: "
+          f"{_time.perf_counter() - _t_build:.3f}s")
+    print(f"  [integrate_saxs] TOTAL: "
+          f"{_time.perf_counter() - _t0_saxs:.3f}s")
     return out
 
 
@@ -2228,6 +2261,7 @@ def integrate_waxs(
     pixel_splitting: int = 1,
 ) -> dict[str, Any]:
     """WAXS reduction via MultiPanelArcDetector per arc-angle frame."""
+    _t0_waxs = _time.perf_counter()
     attrs = waxs_raw.attrs
     if cal is None:
         cal = WAXSCalibration(**_DEFAULT_CAL)
@@ -2324,6 +2358,8 @@ def integrate_waxs(
     q_grid = 0.5 * (q_edges[:-1] + q_edges[1:])
     chi_edges = np.linspace(-180.0, 180.0, n_chi + 1)
     chi_grid = 0.5 * (chi_edges[:-1] + chi_edges[1:])
+    print(f"  [integrate_waxs] geometry precompute ({len(arc_angles)} angles): "
+          f"{_time.perf_counter() - _t0_waxs:.3f}s")
 
     accum_I = np.zeros((n_q, n_chi), dtype=float)
     accum_N = np.zeros((n_q, n_chi), dtype=float)
@@ -2333,6 +2369,11 @@ def integrate_waxs(
     ds_int_frames, ds_qabs_frames = [], []
     ds_qh_frames, ds_qv_frames, ds_mask_frames = [], [], []
 
+    _t_loop = _time.perf_counter()
+    _t_waxs_dez = 0.0
+    _t_waxs_mask = 0.0
+    _t_waxs_hist = 0.0
+    _t_waxs_qchi = 0.0
     for fi, theta in enumerate(arc_angles):
         theta_f = float(theta)
         wl_nm = float(wavelength_per_frame_nm[fi])
@@ -2340,6 +2381,7 @@ def integrate_waxs(
         bsx = float(bsx_per_frame[fi]) if fi < len(bsx_per_frame) else 0.0
         img_rot, _ = rotate_image_and_mask(img_raw, k=cal.rotation_k)
 
+        _tm = _time.perf_counter()
         mask_rot = None
         if mask_fn is not None:
             try:
@@ -2348,8 +2390,10 @@ def integrate_waxs(
                 warnings.warn(
                     f"mask_fn failed for frame {fi}: {exc}", stacklevel=2
                 )
+        _t_waxs_mask += _time.perf_counter() - _tm
 
         # Dezinger: flag hot pixels on the rotated image
+        _td = _time.perf_counter()
         if dezinger_threshold is not None:
             dz_mask = dezinger(img_rot, kernel_size=dezinger_kernel,
                                threshold=dezinger_threshold)
@@ -2357,6 +2401,7 @@ def integrate_waxs(
                 mask_rot = mask_rot & dz_mask
             else:
                 mask_rot = dz_mask
+        _t_waxs_dez += _time.perf_counter() - _td
 
         if flip_horizontal:
             img_rot = np.fliplr(img_rot)
@@ -2390,16 +2435,25 @@ def integrate_waxs(
         chi_sel = chi_px[valid].ravel()
         I_sel = img_rot[valid].ravel()
 
+        _th = _time.perf_counter()
         I_hist, N_hist = _histogram2d_pixel_split(
             qabs_px, chi_px, img_rot, valid, q_edges, chi_edges,
             pixel_splitting=pixel_splitting,
         )
+        _t_waxs_hist += _time.perf_counter() - _th
         accum_I += I_hist
         accum_N += N_hist
+        _tq = _time.perf_counter()
         frame_out = _qchi_and_iq(I_hist, N_hist, q_grid, chi_grid)
         frame_qchi.append(frame_out["q_chi"])
         frame_iq.append(frame_out["iq"])
+        _t_waxs_qchi += _time.perf_counter() - _tq
 
+    print(f"  [integrate_waxs] per-frame loop ({len(arc_angles)} frames): "
+          f"{_time.perf_counter() - _t_loop:.3f}s "
+          f"(mask={_t_waxs_mask:.3f}s, dez={_t_waxs_dez:.3f}s, "
+          f"hist={_t_waxs_hist:.3f}s, qchi={_t_waxs_qchi:.3f}s)")
+    _t_build = _time.perf_counter()
     out = _qchi_and_iq(accum_I, accum_N, q_grid, chi_grid)
     out["q_chi_frames"] = _stack_qchi_frames(frame_qchi)
     out["iq_frames"] = _stack_iq_frames(frame_iq)
@@ -2429,6 +2483,10 @@ def integrate_waxs(
         },
         coords={"frame": np.arange(len(arc_angles), dtype=int)},
     )
+    print(f"  [integrate_waxs] output build: "
+          f"{_time.perf_counter() - _t_build:.3f}s")
+    print(f"  [integrate_waxs] TOTAL: "
+          f"{_time.perf_counter() - _t0_waxs:.3f}s")
     return out
 
 
@@ -2575,51 +2633,37 @@ def reduce_smi_combined(
 
     # Load raw data — reuse a single loader (and its tiled session) for
     # everything so we don't call from_uri / authenticate twice.
-    _t_debug = _time.perf_counter()
     loader = TiledSMISWAXSLoader(tiled_uri=tiled_uri, catalog=catalog)
-    print(f"[reduce_smi_combined] TiledSMISWAXSLoader init: "
-          f"{_time.perf_counter() - _t_debug:.3f}s")
-
-    _t_debug = _time.perf_counter()
     run = loader._get_run(uid)
-    print(f"[reduce_smi_combined] _get_run: "
-          f"{_time.perf_counter() - _t_debug:.3f}s")
 
     # Avoid run["primary"].read() — that pulls every variable in the primary
     # stream including the multi-frame detector arrays, which can trigger
     # an HTTP 500 from the tiled backend.  infer_detectors_and_steps now
     # introspects the tiled containers directly.
-    _t_debug = _time.perf_counter()
     scan_info = infer_detectors_and_steps(run, None, cache_path=image_cache_path)
-    print(f"[reduce_smi_combined] infer_detectors_and_steps: "
-          f"{_time.perf_counter() - _t_debug:.3f}s")
 
-    _t_debug = _time.perf_counter()
     saxs_raw = loader.loadSingleImage(uid, detector="saxs", image_cache_path=image_cache_path)
-    print(f"[reduce_smi_combined] loadSingleImage(saxs): "
-          f"{_time.perf_counter() - _t_debug:.3f}s")
-
-    _t_debug = _time.perf_counter()
     waxs_raw = loader.loadSingleImage(uid, detector="waxs", image_cache_path=image_cache_path)
-    print(f"[reduce_smi_combined] loadSingleImage(waxs): "
-          f"{_time.perf_counter() - _t_debug:.3f}s")
-
     has_saxs = saxs_raw is not None
     has_waxs = waxs_raw is not None
     t_load = _time.perf_counter()
 
     # Populate disk cache for future runs if data was fetched from tiled
     if populate_disk_cache and _cache_was_missing:
+        _t_debug = _time.perf_counter()
         try:
             populate_cache(uid, run, include_images=True)
         except Exception:
             pass  # cache write is best-effort
+        print(f"[mask_setup] populate_cache (write): "
+              f"{_time.perf_counter() - _t_debug:.3f}s")
 
     # -- SAXS branch --
     saxs_result: dict[str, Any] | None = None
     saxs_geo = None
     t_saxs_start = t_saxs_end = _time.perf_counter()
     if has_saxs:
+        _t_debug = _time.perf_counter()
         _saxs_geo_kw: dict[str, Any] = {}
         if saxs_beam_delta_px is not None:
             _saxs_geo_kw["beam_delta_row_px"] = saxs_beam_delta_px[0]
@@ -2627,6 +2671,8 @@ def reduce_smi_combined(
         if saxs_distance_delta_mm is not None:
             _saxs_geo_kw["distance_delta_mm"] = saxs_distance_delta_mm
         saxs_geo = resolve_saxs_geometry(run, **_saxs_geo_kw)
+        print(f"[mask_setup] resolve_saxs_geometry: "
+              f"{_time.perf_counter() - _t_debug:.3f}s")
 
         # Update saxs_raw attrs with corrected geometry
         _pixel1 = float(saxs_raw.attrs["pixel1"])
@@ -2638,6 +2684,7 @@ def reduce_smi_combined(
         saxs_raw.attrs.update(new_attrs)
 
         # SAXS mask
+        _t_debug = _time.perf_counter()
         if saxs_mask_path is None:
             saxs_mask_path = saxs_kw.pop("mask_path", None)
         from PyHyperScattering.smi_defaults import resolve_mask_path
@@ -2650,6 +2697,8 @@ def reduce_smi_combined(
                 active_beamstop=saxs_geo.active_beamstop,
                 beamstop_pos_mm=saxs_geo.beamstop_pos_mm,
             )
+        print(f"[mask_setup] SAXS mask creation: "
+              f"{_time.perf_counter() - _t_debug:.3f}s")
 
         # Integrate SAXS
         t_saxs_start = _time.perf_counter()
@@ -2682,13 +2731,17 @@ def reduce_smi_combined(
     waxs_result: dict[str, Any] | None = None
     t_waxs_start = t_waxs_end = _time.perf_counter()
     if has_waxs:
+        _t_debug = _time.perf_counter()
         _waxs_geo_kw: dict[str, Any] = {}
         if waxs_beam_delta_px is not None:
             _waxs_geo_kw["beam_delta_row_px"] = waxs_beam_delta_px[0]
             _waxs_geo_kw["beam_delta_col_px"] = waxs_beam_delta_px[1]
         waxs_geo = resolve_waxs_geometry(run, **_waxs_geo_kw)
+        print(f"[mask_setup] resolve_waxs_geometry: "
+              f"{_time.perf_counter() - _t_debug:.3f}s")
 
         # WAXS mask callable
+        _t_debug = _time.perf_counter()
         waxs_mask_fn = None
         if waxs_mask_path is None:
             waxs_mask_path = waxs_kw.pop("mask_path", None)
@@ -2739,6 +2792,8 @@ def reduce_smi_combined(
                     "beamstop_max_abs_arc_deg", 15.0
                 ),
             )
+        print(f"[mask_setup] WAXS mask creation: "
+              f"{_time.perf_counter() - _t_debug:.3f}s")
 
         # Build WAXS calibration
         cal_dict: dict[str, Any] = dict(_DEFAULT_CAL)

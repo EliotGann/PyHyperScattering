@@ -2007,47 +2007,24 @@ class TiledSMISWAXSLoader:
 
         # Pre-populate baseline cache from HDF5 if available — avoids
         # tiled round-trips in resolve_*_geometry and load_*_raw.
-        _t = time.perf_counter()
         if image_cache_path is not None:
             _prepopulate_caches_from_h5(run, image_cache_path)
-        print(f"[loadSingleImage({detector})] prepopulate_caches: "
-              f"{time.perf_counter() - _t:.3f}s")
 
         if detector == "saxs":
-            _t = time.perf_counter()
             if not _has_primary_field(run, SAXS_IMAGE_FIELD):
                 return None
-            print(f"[loadSingleImage(saxs)] _has_primary_field check: "
-                  f"{time.perf_counter() - _t:.3f}s")
-            _t = time.perf_counter()
             geo = resolve_saxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
-            print(f"[loadSingleImage(saxs)] resolve_saxs_geometry: "
-                  f"{time.perf_counter() - _t:.3f}s")
-            _t = time.perf_counter()
-            result = load_saxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
-            print(f"[loadSingleImage(saxs)] load_saxs_raw: "
-                  f"{time.perf_counter() - _t:.3f}s")
-            return result
+            return load_saxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
 
         if detector == "waxs":
-            _t = time.perf_counter()
             if not _has_primary_field(run, WAXS_IMAGE_FIELD):
                 return None
-            print(f"[loadSingleImage(waxs)] _has_primary_field check: "
-                  f"{time.perf_counter() - _t:.3f}s")
-            _t = time.perf_counter()
             geo = resolve_waxs_geometry(
                 run, energy_kev=self.energy_kev, **overrides
             )
-            print(f"[loadSingleImage(waxs)] resolve_waxs_geometry: "
-                  f"{time.perf_counter() - _t:.3f}s")
-            _t = time.perf_counter()
-            result = load_waxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
-            print(f"[loadSingleImage(waxs)] load_waxs_raw: "
-                  f"{time.perf_counter() - _t:.3f}s")
-            return result
+            return load_waxs_raw(run, geo, extra_attrs=extra_attrs, image_cache_path=image_cache_path)
 
         raise ValueError(
             f"Unknown detector '{detector}'. Expected 'saxs' or 'waxs'."
