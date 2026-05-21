@@ -205,7 +205,7 @@ class PanelSpec:
 @dataclass
 class WAXSCalibration:
     energy_kev: float = 16.1
-    sample_distance_mm: float = 270.0
+    sample_distance_mm: float = 273.0
     pixel_size_mm: float = 0.172
     beam_center_row: float = 217.0
     beam_center_col: float = 319.0
@@ -258,12 +258,12 @@ class WAXSCalibration:
 # Default calibration matching legacy waxs_reduce._DEFAULT_CAL
 _DEFAULT_CAL = dict(
     energy_kev=16.1,
-    sample_distance_mm=274,
+    sample_distance_mm=273,
     beam_center_row=217.0,
     beam_center_col=319.0,
     panel_offsets_deg=(-7.0, 0.0, 7.0),
     theta_zero_deg=0,
-    sample_offset_z_mm=2.0,
+    sample_offset_z_mm=0.0,
 )
 
 
@@ -2498,9 +2498,9 @@ def reduce_smi_combined(
     uid: str,
     tiled_uri: str = "https://tiled.nsls2.bnl.gov",
     catalog: str = "smi/migration",
-    n_q: int = 1000,
+    n_q: int = 2000,
     n_chi: int = 360,
-    solid_angle_correction: bool = False,
+    solid_angle_correction: bool = True,
     saxs_mask_path: str | Path | None = None,
     waxs_mask_path: str | Path | None = None,
     saxs_kwargs: dict[str, Any] | None = None,
@@ -2516,7 +2516,7 @@ def reduce_smi_combined(
     saxs_q_margin_fraction: float = 0.01,
     dezinger_threshold: float | None = 3000.0,
     dezinger_kernel: int = 5,
-    waxs_beam_col_per_arc_deg: float = 0.0,
+    waxs_beam_col_per_arc_deg: float = 0.08,
     cache_geometry: bool = True,
     pixel_splitting: int = 1,
     image_cache_path: str | Path | None = "auto",
@@ -2800,7 +2800,9 @@ def reduce_smi_combined(
         cal_dict["beam_center_row"] = waxs_geo.beam_center_row_px
         cal_dict["beam_center_col"] = waxs_geo.beam_center_col_px
         cal_dict["energy_kev"] = waxs_geo.energy_ev / 1000.0
-        cal_dict["sample_distance_mm"] = waxs_geo.dist_m * 1000.0
+        # sample_distance_mm: use _DEFAULT_CAL (273 mm) rather than the
+        # motor reading; the calibrated value is more accurate for SMI.
+        # Users can still override via waxs_kwargs.
         if waxs_beam_col_per_arc_deg != 0:
             cal_dict["beam_col_per_arc_deg"] = waxs_beam_col_per_arc_deg
         cal_override_keys = set(WAXSCalibration.__dataclass_fields__.keys())

@@ -207,7 +207,7 @@ class LoaderCalibration:
     saxs_row_delta_px: float = 2.0
     saxs_col_delta_px: float = 3.0
     waxs_row_delta_px: float = 0.0
-    waxs_col_delta_px: float = 0.0
+    waxs_col_delta_px: float = -4.5
     saxs_distance_delta_mm: float = -20.0
 
 
