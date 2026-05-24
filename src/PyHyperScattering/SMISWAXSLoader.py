@@ -803,6 +803,14 @@ def resolve_saxs_geometry(
     beam_col = float(beam_col)
     dist_mm  = float(dist_mm)
 
+    # Beam center pixel coordinates must be positive (they are positions on
+    # the detector image).  Some ophyd configurations store them with a
+    # spurious negative sign — take the absolute value in that case.
+    if beam_row < 0:
+        beam_row = abs(beam_row)
+    if beam_col < 0:
+        beam_col = abs(beam_col)
+
     # Apply additive distance correction (default from calibration; overridable)
     dist_delta_mm = float(
         overrides.get("distance_delta_mm", _SAXS_DEFAULT_DISTANCE_DELTA_MM)
@@ -1417,9 +1425,16 @@ def load_saxs_raw(
     if extra_attrs:
         attrs.update(extra_attrs)
 
+    # Squeeze singleton dimensions (e.g. (120, 1, 619, 1475) -> (120, 619, 1475))
+    images = np.squeeze(images)
     if images.ndim == 2:
         return xr.DataArray(images, dims=["pix_y", "pix_x"], attrs=attrs)
 
+    # Flatten leading dimensions into frames; last two are always (pix_y, pix_x)
+    if images.ndim > 3:
+        orig_shape = images.shape
+        images = images.reshape(-1, *images.shape[-2:])
+        print(f"[SMILoader] SAXS images reshaped from {orig_shape} to {images.shape}")
     if images.ndim != 3:
         raise ValueError(
             f"Expected 2-D or 3-D SAXS image array, got {images.ndim}-D "
@@ -1497,8 +1512,15 @@ def load_waxs_raw(
     bsx_values = _read_scan_axis(run, WAXS_BSX_FIELD, cache_path=image_cache_path)
     energy_per_frame_ev = _read_scan_axis(run, "energy_energy", cache_path=image_cache_path)
 
+    # Squeeze singleton dimensions (e.g. (120, 1, 619, 1475) -> (120, 619, 1475))
+    images = np.squeeze(images)
     if images.ndim == 2:
         images = images[np.newaxis, :, :]
+    # Flatten leading dimensions into frames; last two are always (pix_y, pix_x)
+    if images.ndim > 3:
+        orig_shape = images.shape
+        images = images.reshape(-1, *images.shape[-2:])
+        print(f"[SMILoader] WAXS images reshaped from {orig_shape} to {images.shape}")
     if images.ndim != 3:
         raise ValueError(
             f"Expected 2-D or 3-D WAXS image array, got {images.ndim}-D "

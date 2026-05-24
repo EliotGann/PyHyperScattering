@@ -567,11 +567,15 @@ def make_waxs_mask_callable(
     if "static_regions" in mask_data or "beamstops" in mask_data:
         static_regions = mask_data.get("static_regions", {})
         bs_entry = mask_data.get("beamstops", {}).get("beamstop", {})
-        beamstop_region = (
-            bs_entry.get("polygons", [[]])[0]
-            if bs_entry.get("polygons")
-            else []
-        )
+        if isinstance(bs_entry, list):
+            # beamstop is stored directly as a polygon (list of [x, y] pairs)
+            beamstop_region = bs_entry
+        else:
+            beamstop_region = (
+                bs_entry.get("polygons", [[]])[0]
+                if bs_entry.get("polygons")
+                else []
+            )
     else:
         beamstop_region = mask_data.get("beamstop", [])
         static_regions = {
@@ -1523,6 +1527,11 @@ class GIReductionResult:
         Per-frame I(qxy, qz) images (shape ``(n_qxy, n_qz)``).
     summed : np.ndarray
         Averaged I(qxy, qz) over all frames.
+    q_chi_frames : xr.Dataset or None
+        Per-frame I(qxy, qz) as xr.Dataset with dims (frame, qxy, qz).
+    summed_ds : xr.Dataset or None
+        Summed I(qxy, qz) as xr.Dataset with dims (qxy, qz) and
+        variables ``intensity`` and ``counts``.
     timing : dict[str, float] | None
         Timing breakdown.
     """
@@ -1536,6 +1545,8 @@ class GIReductionResult:
     qz_grid: np.ndarray
     frames: list  # list[np.ndarray]
     summed: np.ndarray
+    q_chi_frames: xr.Dataset | None = None
+    summed_ds: xr.Dataset | None = None
     timing: dict[str, float] | None = None
 
     # -- Line cut helpers --------------------------------------------------
@@ -1688,6 +1699,7 @@ def integrate_waxs_gi(
     cal: WAXSCalibration | None = None,
     dezinger_threshold: float | None = None,
     dezinger_kernel: int = 5,
+    pixel_splitting: int = 1,
 ) -> dict[str, Any]:
     """WAXS GI reduction: bin each frame into (qxy, qz) in the sample frame.
 
@@ -1705,10 +1717,14 @@ def integrate_waxs_gi(
         Detector calibration.  None uses ``_DEFAULT_CAL``.
     dezinger_threshold, dezinger_kernel
         Hot-pixel rejection parameters.
+    pixel_splitting : int
+        Number of sub-pixel divisions per axis for fractional pixel
+        splitting during histogram binning.  1 (default) disables splitting.
 
     Returns
     -------
-    dict with keys ``qxy_grid``, ``qz_grid``, ``frames``, ``summed``.
+    dict with keys ``qxy_grid``, ``qz_grid``, ``frames``, ``summed``,
+    ``q_chi_frames``, ``iq_frames``.
     """
     if cal is None:
         cal = WAXSCalibration(**_DEFAULT_CAL)
@@ -1808,15 +1824,9 @@ def integrate_waxs_gi(
         if mask_rot is not None:
             valid &= mask_rot
 
-        qxy_v = qxy[valid].ravel()
-        qz_v = qz_s[valid].ravel()
-        I_v = img_rot[valid].ravel()
-
-        I_hist, _, _ = np.histogram2d(
-            qxy_v, qz_v, bins=[qxy_edges, qz_edges], weights=I_v,
-        )
-        N_hist, _, _ = np.histogram2d(
-            qxy_v, qz_v, bins=[qxy_edges, qz_edges],
+        I_hist, N_hist = _histogram2d_pixel_split(
+            qxy, qz_s, img_rot, valid, qxy_edges, qz_edges,
+            pixel_splitting=pixel_splitting,
         )
         accum_I += I_hist
         accum_N += N_hist
@@ -1827,11 +1837,48 @@ def integrate_waxs_gi(
     with np.errstate(invalid="ignore", divide="ignore"):
         summed = np.where(accum_N > 0, accum_I / accum_N, np.nan)
 
+    # Build xr.Dataset outputs paralleling the transmission path
+    # Per-frame qxy-qz maps as xr.Dataset
+    frame_qchi: list[xr.Dataset] = []
+    for fmap in frame_maps:
+        frame_qchi.append(xr.Dataset(
+            {
+                "intensity": (("qxy", "qz"), fmap),
+            },
+            coords={"qxy": qxy_grid, "qz": qz_grid},
+        ))
+
+    # Stacked per-frame dataset
+    q_chi_frames = xr.Dataset(
+        {
+            "intensity": (
+                ("frame", "qxy", "qz"),
+                np.stack(frame_maps, axis=0),
+            ),
+        },
+        coords={
+            "frame": np.arange(n_frames, dtype=int),
+            "qxy": qxy_grid,
+            "qz": qz_grid,
+        },
+    )
+
+    # Summed (averaged) dataset
+    summed_ds = xr.Dataset(
+        {
+            "intensity": (("qxy", "qz"), summed),
+            "counts": (("qxy", "qz"), accum_N),
+        },
+        coords={"qxy": qxy_grid, "qz": qz_grid},
+    )
+
     return {
         "qxy_grid": qxy_grid,
         "qz_grid": qz_grid,
         "frames": frame_maps,
         "summed": summed,
+        "q_chi_frames": q_chi_frames,
+        "summed_ds": summed_ds,
     }
 
 
@@ -1855,6 +1902,7 @@ def reduce_smi_gi(
     waxs_cal_overrides: dict[str, Any] | None = None,
     image_cache_path: str | Path | None = "auto",
     populate_disk_cache: bool = True,
+    pixel_splitting: int = 1,
 ) -> GIReductionResult:
     """Full grazing-incidence WAXS reduction pipeline.
 
@@ -1893,6 +1941,9 @@ def reduce_smi_gi(
     populate_disk_cache : bool
         If True (default) and no cache file existed, write fetched data
         to the cache after loading from tiled.
+    pixel_splitting : int
+        Number of sub-pixel divisions per axis for fractional pixel
+        splitting during histogram binning.  1 (default) disables splitting.
 
     Returns
     -------
@@ -1989,6 +2040,7 @@ def reduce_smi_gi(
         cal=waxs_cal,
         dezinger_threshold=dezinger_threshold,
         dezinger_kernel=dezinger_kernel,
+        pixel_splitting=pixel_splitting,
     )
     t_done = _time.perf_counter()
 
@@ -2003,6 +2055,8 @@ def reduce_smi_gi(
         qz_grid=gi_out["qz_grid"],
         frames=gi_out["frames"],
         summed=gi_out["summed"],
+        q_chi_frames=gi_out["q_chi_frames"],
+        summed_ds=gi_out["summed_ds"],
         timing={
             "total": t_done - t0,
             "tiled_load": t_load - t0,
