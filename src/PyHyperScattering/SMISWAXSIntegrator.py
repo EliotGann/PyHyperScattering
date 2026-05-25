@@ -515,8 +515,38 @@ def make_saxs_mask_from_spec(
     mask_path: str | Path,
     active_beamstop: str = "rod",
     beamstop_pos_mm: dict | None = None,
+    beam_center_px: tuple[float, float] | None = None,
 ) -> np.ndarray:
-    """Build a static SAXS mask (True = valid) from a JSON mask spec."""
+    """Build a static SAXS mask (True = valid) from a JSON mask spec.
+
+    Beamstop polygons may be specified in two ways:
+
+    * ``polygon_offsets_from_beam`` — list of ``[d_col, d_row]`` offsets
+      relative to the resolved beam center.  This is the preferred form
+      because the beam center already accounts for detector motor
+      positions (pil2M_motor_x/y) and sample-z offsets (piezo_z).  Requires
+      *beam_center_px* to be supplied.  Also accepts a list of polygons.
+
+    * ``polygon`` (legacy) — absolute pixel coordinates.  The polygon is
+      then shifted by ``(cur_motor - reference_mm) * pixels_per_mm`` if
+      *beamstop_pos_mm* is provided.  Retained for backwards compatibility
+      with mask files written before beam-center anchoring was supported.
+
+    Parameters
+    ----------
+    image_shape : (rows, cols)
+        Raw detector image shape.
+    mask_path : path-like
+        JSON polygon spec.
+    active_beamstop : {'rod', 'pin'} or other key present in mask spec
+        Which beamstop is currently in the beam.  Selects the matching
+        polygon (or polygons) from the ``beamstops`` block.
+    beamstop_pos_mm : dict | None
+        Per-beamstop motor positions (legacy ``polygon`` only).
+    beam_center_px : (row, col) | None
+        Resolved beam center in raw-detector pixel coordinates.  Required
+        when a beamstop entry uses ``polygon_offsets_from_beam``.
+    """
     with open(mask_path) as f:
         mask_spec = json.load(f)
 
@@ -525,32 +555,54 @@ def make_saxs_mask_from_spec(
     polys = list(static_regions.values())
 
     bs = beamstops_spec.get(active_beamstop, {})
-    bs_ref = bs.get("reference_mm", {})
-    bs_ref_x = bs_ref.get("x", 0.0)
-    bs_ref_y = bs_ref.get("y", 0.0)
-    bs_poly = bs.get("polygon")
-    px_per_mm_map = bs.get("pixels_per_mm", {})
-    px_per_mm_x = (
-        px_per_mm_map.get("x", 1.0 / 0.172)
-        if isinstance(px_per_mm_map, dict)
-        else float(px_per_mm_map)
-    )
-    px_per_mm_y = (
-        px_per_mm_map.get("y", 1.0 / 0.172)
-        if isinstance(px_per_mm_map, dict)
-        else float(px_per_mm_map)
-    )
 
-    if bs_poly is not None:
-        if beamstop_pos_mm:
-            cur = beamstop_pos_mm.get(active_beamstop) or {}
-            cur_x = cur.get("x") or bs_ref_x
-            cur_y = cur.get("y") or bs_ref_y
-            dx = (cur_x - bs_ref_x) * px_per_mm_x
-            dy = (cur_y - bs_ref_y) * px_per_mm_y
-            polys.append(shift_polygon(bs_poly, dx_px=dx, dy_px=dy))
+    bs_offsets = bs.get("polygon_offsets_from_beam")
+    if bs_offsets is not None:
+        if beam_center_px is None:
+            warnings.warn(
+                f"Beamstop {active_beamstop!r} uses polygon_offsets_from_beam "
+                "but no beam_center_px was provided — skipping beamstop mask.",
+                stacklevel=2,
+            )
         else:
-            polys.append(bs_poly)
+            bc_row, bc_col = float(beam_center_px[0]), float(beam_center_px[1])
+            # Normalize to a list of polygons (single polygon → list-of-one).
+            if bs_offsets and isinstance(bs_offsets[0][0], (list, tuple)):
+                offset_polys = bs_offsets
+            else:
+                offset_polys = [bs_offsets]
+            for offs in offset_polys:
+                if not offs:
+                    continue
+                shifted = [[bc_col + float(dc), bc_row + float(dr)]
+                           for dc, dr in offs]
+                polys.append(shifted)
+    else:
+        bs_poly = bs.get("polygon")
+        if bs_poly is not None:
+            bs_ref = bs.get("reference_mm", {})
+            bs_ref_x = bs_ref.get("x", 0.0)
+            bs_ref_y = bs_ref.get("y", 0.0)
+            px_per_mm_map = bs.get("pixels_per_mm", {})
+            px_per_mm_x = (
+                px_per_mm_map.get("x", 1.0 / 0.172)
+                if isinstance(px_per_mm_map, dict)
+                else float(px_per_mm_map)
+            )
+            px_per_mm_y = (
+                px_per_mm_map.get("y", 1.0 / 0.172)
+                if isinstance(px_per_mm_map, dict)
+                else float(px_per_mm_map)
+            )
+            if beamstop_pos_mm:
+                cur = beamstop_pos_mm.get(active_beamstop) or {}
+                cur_x = cur.get("x") or bs_ref_x
+                cur_y = cur.get("y") or bs_ref_y
+                dx = (cur_x - bs_ref_x) * px_per_mm_x
+                dy = (cur_y - bs_ref_y) * px_per_mm_y
+                polys.append(shift_polygon(bs_poly, dx_px=dx, dy_px=dy))
+            else:
+                polys.append(bs_poly)
 
     return polygons_to_mask(image_shape, polys)
 
@@ -811,11 +863,15 @@ def mask_for_frame(
         except Exception:
             pass
 
+        bc_px = None
+        if saxs_geo is not None:
+            bc_px = (saxs_geo.beam_center_row_px, saxs_geo.beam_center_col_px)
         mask = make_saxs_mask_from_spec(
             image_shape=raw_shape,
             mask_path=resolved_mask_path,
             active_beamstop=active_bs,
             beamstop_pos_mm=bs_pos,
+            beam_center_px=bc_px,
         )
 
         # AND in the per-frame WAXS-shadow occlusion (depends on
@@ -909,20 +965,42 @@ def _make_waxs_shadow_mask(
 
 
 def _make_aperture_mask(q_abs, **kwargs) -> np.ndarray:
+    """Build an angular (in q) aperture mask: True = keep, False = occlude.
+
+    The aperture models a physical occlusion (typically the WAXS detector arc
+    blocking part of the SAXS detector's view).  Occlusion is defined in
+    *angle* (here parameterised as a q-cutoff, which is angle for fixed
+    wavelength).  Two key behaviours:
+
+    * The cutoff is computed from AGB d-spacing alone, never from "the
+      highest visible ring on this detector" — silently clamping to the
+      highest visible ring caused over-occlusion at large SDD where the
+      requested ring order wasn't even visible.
+    * If the cutoff exceeds the detector's maximum q (i.e., the angular
+      cutoff falls beyond the corner of the detector), no occlusion is
+      applied.  This naturally turns the aperture off at long SDD (e.g.,
+      9 m), and turns it on at short SDD (e.g., 2 m) where it physically
+      represents what the WAXS detector blocks.
+    """
     enabled = kwargs.get("enabled", True)
     if not enabled:
         return np.ones_like(q_abs, dtype=bool)
     q_cutoff = kwargs.get("q_cutoff")
     if q_cutoff is None:
-        max_q = float(np.nanmax(q_abs))
         ring_order = max(int(kwargs.get("agbh_ring_order", 5)), 1)
-        rings = _silver_behenate_q_rings(max_q=max_q, max_order=max(ring_order, 20))
-        if rings.size == 0:
-            return np.ones_like(q_abs, dtype=bool)
-        idx = min(ring_order, rings.size) - 1
+        # AGB ring n in q-space (depends on d-spacing only — angle by Bragg
+        # is wavelength-dependent, but q is the wavelength-independent
+        # reciprocal-space coordinate, so q_n = 2π n / D works for any λ).
+        D_nm = 5.838
+        q_cutoff = (2.0 * np.pi / D_nm) * ring_order
         q_margin = float(kwargs.get("q_margin_fraction", 0.08))
-        q_cutoff = float(rings[idx]) * (1.0 + q_margin)
-    return np.isfinite(q_abs) & (q_abs <= float(q_cutoff))
+        q_cutoff *= (1.0 + q_margin)
+    # Off-detector cutoff → no occlusion (long-SDD short-q-range case).
+    finite = np.isfinite(q_abs)
+    detector_max_q = float(np.nanmax(q_abs)) if finite.any() else 0.0
+    if float(q_cutoff) >= detector_max_q:
+        return finite
+    return finite & (q_abs <= float(q_cutoff))
 
 
 def make_saxs_large_area_masks(
@@ -2750,6 +2828,10 @@ def reduce_smi_combined(
                 mask_path=saxs_mask_path,
                 active_beamstop=saxs_geo.active_beamstop,
                 beamstop_pos_mm=saxs_geo.beamstop_pos_mm,
+                beam_center_px=(
+                    saxs_geo.beam_center_row_px,
+                    saxs_geo.beam_center_col_px,
+                ),
             )
         print(f"[mask_setup] SAXS mask creation: "
               f"{_time.perf_counter() - _t_debug:.3f}s")

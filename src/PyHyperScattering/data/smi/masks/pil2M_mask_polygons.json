@@ -169,23 +169,17 @@
   },
   "beamstops": {
     "rod": {
+      "polygon_offsets_from_beam": [
+        [-14, -459],
+        [14, -459],
+        [14, 575],
+        [-14, 575]
+      ],
       "polygon": [
-        [
-          737.0,
-          648.0
-        ],
-        [
-          765.0,
-          648.0
-        ],
-        [
-          765.0,
-          1679.0
-        ],
-        [
-          737.0,
-          1679.0
-        ]
+        [737.0, 648.0],
+        [765.0, 648.0],
+        [765.0, 1679.0],
+        [737.0, 1679.0]
       ],
       "x_motor_key": "saxs_beamstop_x_rod_user_setpoint",
       "y_motor_key": "saxs_beamstop_y_rod_user_setpoint",
@@ -199,23 +193,25 @@
       }
     },
     "pin": {
-      "polygon": [
+      "polygon_offsets_from_beam": [
         [
-          840.0,
-          1622.0
+          [-18, -18],
+          [18, -18],
+          [18, 22],
+          [-18, 22]
         ],
         [
-          860.0,
-          1622.0
-        ],
-        [
-          860.0,
-          1679.0
-        ],
-        [
-          840.0,
-          1679.0
+          [-5, 22],
+          [5, 22],
+          [5, 640],
+          [-5, 640]
         ]
+      ],
+      "polygon": [
+        [840.0, 1622.0],
+        [860.0, 1622.0],
+        [860.0, 1679.0],
+        [840.0, 1679.0]
       ],
       "x_motor_key": "saxs_beamstop_x_pin_user_setpoint",
       "y_motor_key": "saxs_beamstop_y_pin_user_setpoint",

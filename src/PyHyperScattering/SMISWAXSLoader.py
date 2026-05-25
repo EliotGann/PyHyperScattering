@@ -37,6 +37,11 @@ import xarray as xr
 _BASELINE_CACHE: dict[str, xr.Dataset | None] = {}  # keyed by run UID
 _BASELINE_COLUMNS_CACHE: dict[str, list[str]] = {}   # keyed by run UID
 _TARGET_FILE_NAME_CACHE: dict[str, list[dict[str, float]] | None] = {}  # keyed by run UID
+# Per-run sort indices for primary-stream scalars.  Set to None when the
+# scalar table is already chronologically ordered (no reindex needed); set
+# to a numpy index array when scalars must be re-sorted to align with the
+# (chronological) image stack.  See _primary_seq_sort_indices().
+_PRIMARY_SEQ_SORT_CACHE: dict[str, np.ndarray | None] = {}
 
 
 def clear_baseline_cache() -> None:
@@ -44,6 +49,7 @@ def clear_baseline_cache() -> None:
     _BASELINE_CACHE.clear()
     _BASELINE_COLUMNS_CACHE.clear()
     _TARGET_FILE_NAME_CACHE.clear()
+    _PRIMARY_SEQ_SORT_CACHE.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -66,9 +72,33 @@ DEFAULT_ENERGY_KEV = 16.1
 _SAXS_DEFAULT_DISTANCE_MM  = 2000.0
 _SAXS_DEFAULT_BEAM_ROW_PX  = 1165.0          # fallback if metadata absent
 _SAXS_DEFAULT_BEAM_COL_PX  =  746.0          # fallback if metadata absent
-_SAXS_DEFAULT_DISTANCE_DELTA_MM = -20.0       # additive correction to motor z
-_SAXS_DEFAULT_BEAM_DELTA_ROW_PX =  2.0        # additive correction to metadata row
-_SAXS_DEFAULT_BEAM_DELTA_COL_PX =  3.0        # additive correction to metadata col
+# Offset between pil2M_motor_z readback and actual sample-detector distance,
+# at piezo_z = piezo_z_ref.  Calibrated against AGB ring radius on scan
+# b0f165c4-… (AGB_scan_x_y_9m, motor_z=9200, fitted SDD=9007, → −193).
+_SAXS_DEFAULT_DISTANCE_DELTA_MM = -193.0
+_SAXS_DEFAULT_BEAM_DELTA_ROW_PX =  0.0        # additive correction to metadata row
+_SAXS_DEFAULT_BEAM_DELTA_COL_PX =  0.0        # additive correction to metadata col
+
+# SAXS motor-driven geometry corrections.
+# The baseline EPICS PVs (pil2M_beam_center_x_px, pil2M_beam_center_y_px) are
+# static calibration values, set once at a known motor configuration.  When
+# the detector translates (pil2M_motor_x/y) or the sample moves along the beam
+# (piezo_z), the physical beam position on the detector and the effective
+# sample-detector distance both shift.  These constants encode the linear
+# mapping; values are overrideable per-call.  Calibrated from the AGB grid
+# scan b0f165c4-203e-4d58-af17-916620b974c2 (regression residuals ≤1 px).
+_SAXS_MOTOR_X_REF_MM: float = 1.88             # baseline EPICS bc_col matches actual at this motor_x
+_SAXS_MOTOR_Y_REF_MM: float = 2.45             # baseline EPICS bc_row matches actual at this motor_y
+_SAXS_PIEZO_Z_REF_UM: float = 0.0              # piezo_z reference (offset absorbed in DISTANCE_DELTA)
+# px/mm slopes from regression: motor_x→bc_col slope = 5.821 = 1/0.172 exactly.
+# motor_y→bc_row slope ≈ 5.996 (slightly steeper than nominal; possibly the
+# stage is not perfectly perpendicular).
+_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM: float = +5.8211
+_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM: float = +5.9963
+# piezo_z (μm) → SDD: positive piezo_z moves sample downstream (toward
+# detector?) but with slope close to +1 mm/mm in the fit.  Sign-positive
+# means +piezo → +SDD; verify in subsequent calibrations.
+_SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM: float = +0.000988
 
 # WAXS defaults (900KW arc detector at ~274 mm)
 _WAXS_DEFAULT_DISTANCE_MM  = 270.0
@@ -419,6 +449,62 @@ def _run_uid(run: Any) -> str:
         return str(id(run))
 
 
+def _primary_seq_sort_indices(run: Any) -> np.ndarray | None:
+    """Return argsort indices that reorder primary scalars to chronological order.
+
+    The SMI tiled migration catalog has been observed to serve primary-stream
+    *scalar* tables (motors, signals) in a non-chronological order while the
+    *image* stack remains in chronological (seq_num) order.  Reading
+    ``motor_x[i]`` and ``pil2M_image[i]`` then yields a *mismatched* pair.
+
+    This helper reads ``seq_num`` from the primary stream and returns the
+    indices that sort it to chronological order.  Callers reading any
+    per-frame scalar should apply these indices so the array aligns with
+    ``image[i]``.  Returns ``None`` when seq_num is already monotonic (no
+    reindex needed) or unavailable.  Results are cached per run UID.
+    """
+    rid = _run_uid(run)
+    if rid in _PRIMARY_SEQ_SORT_CACHE:
+        return _PRIMARY_SEQ_SORT_CACHE[rid]
+
+    seq_arr: np.ndarray | None = None
+    try:
+        node = _get_primary_field_node(run, "seq_num")
+        raw = node.read() if hasattr(node, "read") else node[...]
+        seq_arr = np.asarray(raw).astype(np.int64).ravel()
+    except Exception:
+        seq_arr = None
+
+    if seq_arr is None or seq_arr.size == 0:
+        _PRIMARY_SEQ_SORT_CACHE[rid] = None
+        return None
+
+    if np.all(np.diff(seq_arr) > 0):
+        _PRIMARY_SEQ_SORT_CACHE[rid] = None  # already chronological
+        return None
+
+    order = np.argsort(seq_arr, kind="stable")
+    _PRIMARY_SEQ_SORT_CACHE[rid] = order
+    return order
+
+
+def _apply_primary_sort(arr: np.ndarray | None, run: Any) -> np.ndarray | None:
+    """Reorder a 1-D per-frame primary scalar to chronological seq order.
+
+    No-op when shape doesn't match the seq_num length or the table is
+    already monotonic (see :func:`_primary_seq_sort_indices`).
+    """
+    if arr is None:
+        return None
+    order = _primary_seq_sort_indices(run)
+    if order is None:
+        return arr
+    arr = np.asarray(arr)
+    if arr.ndim != 1 or arr.shape[0] != order.shape[0]:
+        return arr
+    return arr[order]
+
+
 def _read_baseline(run: Any) -> xr.Dataset | None:
     """Read the baseline stream as an xr.Dataset (legacy path).
 
@@ -516,6 +602,9 @@ def _primary_scalar(run: Any, field: str) -> Any:
     Only returns a value if the field exists in primary AND has a single
     unique value (i.e., it's a "read" companion, not the varying scan axis).
     For varying scan axes, use _read_scan_axis() instead.
+
+    For scrambled tables, "first" means chronologically first (seq_num=1),
+    which requires sorting before indexing.
     """
     if not _has_primary_field(run, field):
         return None
@@ -523,14 +612,47 @@ def _primary_scalar(run: Any, field: str) -> Any:
         node = _get_primary_field_node(run, field)
         values = node.read() if hasattr(node, "read") else node[...]
         arr = np.asarray(values, dtype=float)
-        # If all values are the same, treat as a scalar
+        # If all values are the same, sort doesn't matter — just return one
         if arr.size > 0 and np.all(arr == arr[0]):
             return float(arr[0])
-        # If values vary, return the first (start-of-scan position)
+        # Otherwise reorder to chronological order so [0] is the first frame
         if arr.size > 0:
+            arr = _apply_primary_sort(arr, run)
             return float(arr[0])
     except Exception:
         pass
+    return None
+
+
+def _read_first_scalar(
+    run: Any,
+    field: str,
+    baseline_keys: tuple[str, ...] = (),
+    baseline_ds: xr.Dataset | None = None,
+) -> float | None:
+    """Resolve a motor scalar: primary first-frame → baseline → baseline ds.
+
+    Used by geometry resolvers to get a single reference value for a motor
+    that may be in any of (a) the primary stream as a per-frame array,
+    (b) the baseline stream as a 1- or 2-element snapshot, or (c) absent.
+    Returns ``None`` when the field cannot be located anywhere.
+    """
+    val = _primary_scalar(run, field)
+    if val is not None:
+        return float(val)
+    for key in baseline_keys or (field,):
+        val = _baseline_scalar(run, key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
+        val = _dataset_scalar(baseline_ds, key)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                continue
     return None
 
 
@@ -648,7 +770,13 @@ def parse_sample_name_geometry(sample_name: str) -> dict[str, float]:
 
 @dataclass
 class SAXSGeometry:
-    """Resolved geometry parameters for the SAXS (Pilatus 2M) detector."""
+    """Resolved geometry parameters for the SAXS (Pilatus 2M) detector.
+
+    All values represent the *reference* (first-frame, or single-geometry)
+    state.  Per-frame motor positions are attached to the loader's DataArray
+    as coords on the frame dim; downstream code that needs per-frame geometry
+    should consume those.
+    """
     dist_m: float
     poni1_m: float
     poni2_m: float
@@ -663,6 +791,12 @@ class SAXSGeometry:
     beam_center_col_px: float = _SAXS_DEFAULT_BEAM_COL_PX
     active_beamstop: str = "rod"
     beamstop_pos_mm: dict | None = None
+    # Motor positions used to compute this geometry (reference frame value).
+    # Populated by resolve_saxs_geometry; None when the field is unavailable.
+    motor_x_mm: float | None = None
+    motor_y_mm: float | None = None
+    motor_z_mm: float | None = None
+    piezo_z_um: float | None = None
 
 
 @dataclass
@@ -811,6 +945,44 @@ def resolve_saxs_geometry(
     if beam_col < 0:
         beam_col = abs(beam_col)
 
+    # --- Motor-driven beam center & SDD corrections -------------------------
+    # Read pil2M_motor_x, pil2M_motor_y, piezo_z (primary → baseline) and
+    # offset the reference beam center / distance accordingly.  When motors
+    # are scanned (in primary), this uses the first-frame value as the
+    # reference; per-frame variation is exposed as coords on the DataArray.
+    motor_x_mm = _read_first_scalar(
+        run, "pil2M_motor_x", baseline_keys=("pil2M_motor_x_user_setpoint", "pil2M_motor_x"),
+        baseline_ds=baseline,
+    )
+    motor_y_mm = _read_first_scalar(
+        run, "pil2M_motor_y", baseline_keys=("pil2M_motor_y_user_setpoint", "pil2M_motor_y"),
+        baseline_ds=baseline,
+    )
+    piezo_z_um = _read_first_scalar(
+        run, "piezo_z", baseline_keys=("piezo_z_user_setpoint", "piezo_z"),
+        baseline_ds=baseline,
+    )
+
+    motor_x_ref_mm = float(overrides.get("motor_x_ref_mm", _SAXS_MOTOR_X_REF_MM))
+    motor_y_ref_mm = float(overrides.get("motor_y_ref_mm", _SAXS_MOTOR_Y_REF_MM))
+    piezo_z_ref_um = float(overrides.get("piezo_z_ref_um", _SAXS_PIEZO_Z_REF_UM))
+    col_per_mx = float(
+        overrides.get("beam_col_px_per_motor_x_mm", _SAXS_BEAM_COL_PX_PER_MOTOR_X_MM)
+    )
+    row_per_my = float(
+        overrides.get("beam_row_px_per_motor_y_mm", _SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM)
+    )
+    sdd_per_pz = float(
+        overrides.get("sdd_delta_mm_per_piezo_z_um", _SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM)
+    )
+
+    if motor_x_mm is not None:
+        beam_col += (motor_x_mm - motor_x_ref_mm) * col_per_mx
+    if motor_y_mm is not None:
+        beam_row += (motor_y_mm - motor_y_ref_mm) * row_per_my
+    if piezo_z_um is not None:
+        dist_mm += (piezo_z_um - piezo_z_ref_um) * sdd_per_pz
+
     # Apply additive distance correction (default from calibration; overridable)
     dist_delta_mm = float(
         overrides.get("distance_delta_mm", _SAXS_DEFAULT_DISTANCE_DELTA_MM)
@@ -825,6 +997,12 @@ def resolve_saxs_geometry(
         overrides.get("beam_delta_col_px", _SAXS_DEFAULT_BEAM_DELTA_COL_PX)
     )
 
+    motor_z_mm = _read_first_scalar(
+        run, "pil2M_motor_z",
+        baseline_keys=("pil2M_motor_z_user_setpoint", "pil2M_motor_z"),
+        baseline_ds=baseline,
+    )
+
     return SAXSGeometry(
         dist_m=dist_mm / 1000.0,
         poni1_m=beam_row * PILATUS_PIXEL_SIZE_M,
@@ -835,6 +1013,10 @@ def resolve_saxs_geometry(
         beam_center_col_px=beam_col,
         active_beamstop=str(active_bs),
         beamstop_pos_mm=bs_pos,
+        motor_x_mm=motor_x_mm,
+        motor_y_mm=motor_y_mm,
+        motor_z_mm=motor_z_mm,
+        piezo_z_um=piezo_z_um,
     )
 
 
@@ -1286,7 +1468,11 @@ def _read_scan_axis(run: Any, field: str, cache_path: str | Path | None = None) 
         try:
             node = _get_primary_field_node(run, field)
             values = node.read() if hasattr(node, "read") else node[...]
-            return np.asarray(values, dtype=float)
+            arr = np.asarray(values, dtype=float)
+            # Reorder to chronological seq_num order so the array aligns
+            # with the (chronological) image stack.  No-op when the table
+            # is already monotonic or the shape doesn't match.
+            return _apply_primary_sort(arr, run)
         except Exception:
             pass
 
@@ -1295,7 +1481,9 @@ def _read_scan_axis(run: Any, field: str, cache_path: str | Path | None = None) 
         try:
             arr = _read_primary_internal_array(run, field)
             if arr is not None and arr.size > 0:
-                return np.asarray(arr, dtype=float)
+                return _apply_primary_sort(
+                    np.asarray(arr, dtype=float), run,
+                )
         except (ValueError, TypeError):
             # Field exists but is non-numeric (e.g. target_file_name) — skip
             pass
@@ -1449,10 +1637,22 @@ def load_saxs_raw(
         frame_coord = np.arange(n_frames)
         frame_dim_name = "frame"
 
+    coords: dict[str, Any] = {frame_dim_name: frame_coord}
+    # Attach per-frame motor positions when they vary across the scan.  These
+    # let downstream code compute per-frame beam center / SDD via the same
+    # offsets that resolve_saxs_geometry applies to the reference frame.
+    for motor_name in ("pil2M_motor_x", "pil2M_motor_y",
+                       "pil2M_motor_z", "piezo_z"):
+        arr = _read_scan_axis(run, motor_name, cache_path=image_cache_path)
+        if arr is None or arr.size == 0:
+            continue
+        if arr.shape[0] == n_frames:
+            coords[motor_name] = (frame_dim_name, arr.astype(float))
+
     return xr.DataArray(
         images,
         dims=[frame_dim_name, "pix_y", "pix_x"],
-        coords={frame_dim_name: frame_coord},
+        coords=coords,
         attrs=attrs,
     )
 
