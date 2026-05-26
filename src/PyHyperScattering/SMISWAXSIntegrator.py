@@ -2604,16 +2604,24 @@ def integrate_saxs(
     _t_bins = _time.perf_counter()
     q_vals = q2d[base_valid]
     chi_vals = chi_deg_2d[base_valid]
+    # Use the full physical range of the unmasked detector for q and chi
+    # bin edges.  An earlier version used np.percentile(q_vals, [0.5, 99.5])
+    # to clip outliers, but this silently dropped the lowest q values —
+    # the most important region for USAXS scans (long-SDD, small q_min).
+    # The mask already excludes bad/beamstop pixels, so the literal
+    # min/max of surviving q is the right physical range.
     if q_vals.size > 0:
-        q_min, q_max = np.percentile(q_vals, [0.5, 99.5])
-        q_edges = np.linspace(float(q_min), float(q_max), n_q + 1)
+        q_min = float(np.nanmin(q_vals))
+        q_max = float(np.nanmax(q_vals))
+        q_edges = np.linspace(q_min, q_max, n_q + 1)
     else:
         q_edges = np.linspace(0.0, 10.0, n_q + 1)
     q_grid = 0.5 * (q_edges[:-1] + q_edges[1:])
 
     if chi_vals.size > 0:
-        chi_min, chi_max = np.percentile(chi_vals, [0.5, 99.5])
-        chi_edges = np.linspace(float(chi_min), float(chi_max), n_chi + 1)
+        chi_min = float(np.nanmin(chi_vals))
+        chi_max = float(np.nanmax(chi_vals))
+        chi_edges = np.linspace(chi_min, chi_max, n_chi + 1)
     else:
         chi_edges = np.linspace(-180.0, 180.0, n_chi + 1)
     chi_grid = 0.5 * (chi_edges[:-1] + chi_edges[1:])

@@ -431,6 +431,74 @@ class TestIntegrateSAXSEndToEnd:
             f"or vice versa)."
         )
 
+    def test_q_range_not_clipped_below_low_q(self):
+        """q_min must reflect the actual minimum q in the unmasked image,
+        not a percentile clip.
+
+        USAXS at long SDD has its most important physics at the lowest q
+        values; an earlier version clipped the bottom 0.5% via
+        np.percentile, which silently lost the low-q range users came
+        for.  q_min should be within a few percent of the true minimum
+        of unmasked pixel q-values.
+        """
+        from PyHyperScattering.SMISWAXSIntegrator import integrate_saxs
+
+        ny, nx = 51, 51
+        # Place the beam center off-corner so the minimum pixel q
+        # (1 pixel from beam) is well-defined and noticeably > 0.
+        r0, c0 = 10.0, 10.0
+        images = np.ones((1, ny, nx), dtype=np.float32) * 1000.0
+        run = _FakeRun(primary_fields={L.SAXS_IMAGE_FIELD: images})
+        geo = L.SAXSGeometry(
+            dist_m=2.0,
+            poni1_m=r0 * L.PILATUS_PIXEL_SIZE_M,
+            poni2_m=c0 * L.PILATUS_PIXEL_SIZE_M,
+            pixel1_m=L.PILATUS_PIXEL_SIZE_M,
+            pixel2_m=L.PILATUS_PIXEL_SIZE_M,
+            energy_ev=16100.0,
+            wavelength_m=7.7008e-11,
+            beam_center_row_px=r0,
+            beam_center_col_px=c0,
+        )
+        saxs_raw = L.load_saxs_raw(run, geo)
+        result = integrate_saxs(
+            saxs_raw=saxs_raw, mask=None,
+            n_q=200, n_chi=90,
+            beam_center_col_px=c0,
+            solid_angle_correction=False,
+            dezinger_threshold=None,
+            cache_geometry=False,
+        )
+        q = np.asarray(result["q_chi"]["q"].values, dtype=float)
+
+        # Compute the *true* min q the integrator could see — the q of
+        # the unmasked pixel closest to the beam.  Anything beyond ~2%
+        # above this floor means a cutoff has crept back in.
+        # Pixel (0, 0) is the corner; pixel (r0+1, c0) is one pixel below
+        # the beam in the row direction, so its q corresponds to one
+        # pixel worth of distance.
+        from PyHyperScattering.SMISWAXSIntegrator import (
+            wavelength_nm_from_energy_kev,
+        )
+        wavelength_nm = wavelength_nm_from_energy_kev(16.1)
+        # Smallest non-zero pixel offset = 1 pixel
+        pixel_size_mm = L.PILATUS_PIXEL_SIZE_M * 1000
+        # q for 1 pixel away in small-angle limit:
+        # theta ≈ pixel_size / SDD, q = (2π/λ) × sin(theta)
+        sdd_mm = 2000.0
+        theta = pixel_size_mm / sdd_mm
+        q_one_pixel_nm = (2 * np.pi / wavelength_nm) * np.sin(theta / 2) * 2
+        # When using the literal min of q_vals (which includes the beam
+        # center pixel at q=0), q_grid[0] should be ~dq/2 — much smaller
+        # than one pixel's q.  A percentile clip would push q_min up to
+        # roughly the q of pixels a few rows out from beam.  Asserting
+        # q.min() < q_one_pixel_nm cleanly separates the two regimes.
+        assert q.min() < q_one_pixel_nm, (
+            f"q_min = {q.min():.4g} nm⁻¹ is too high relative to "
+            f"one-pixel q ({q_one_pixel_nm:.4g}) — a low-q cutoff has "
+            f"likely crept back in (e.g. np.percentile)."
+        )
+
     def test_integrate_saxs_via_attrs_consistent_with_loader(self):
         """Round-trip: integrating a freshly-loaded DataArray must yield
         finite intensities (catches attrs-vs-integrator unit mismatches)."""
