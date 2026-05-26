@@ -126,12 +126,19 @@ def test_classify_detector_field_none_input():
 # ---------------------------------------------------------------------------
 
 def test_loader_defaults_values():
+    """Asserts the *current* loader defaults.
+
+    These should match the ``_*_DEFAULT_*`` constants in
+    :mod:`PyHyperScattering.SMISWAXSLoader`.  If you bump those constants
+    (e.g. via a recalibration), update this test in the same commit so
+    drift is caught immediately.
+    """
     cal = D.LOADER_DEFAULTS
-    assert cal.saxs_row_delta_px == 2.0
-    assert cal.saxs_col_delta_px == 3.0
+    assert cal.saxs_row_delta_px == 0.0
+    assert cal.saxs_col_delta_px == 0.0
     assert cal.waxs_row_delta_px == 0.0
-    assert cal.waxs_col_delta_px == -2.0
-    assert cal.saxs_distance_delta_mm == -20.0
+    assert cal.waxs_col_delta_px == -4.5
+    assert cal.saxs_distance_delta_mm == -193.0
 
 
 def test_bsx_per_arc_deg():

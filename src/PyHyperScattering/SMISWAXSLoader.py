@@ -1613,6 +1613,9 @@ def load_saxs_raw(
     }
     if extra_attrs:
         attrs.update(extra_attrs)
+    # Drop None-valued attrs so the DataArray is netCDF/Zarr/Tiled
+    # serializable (those backends reject None in attrs).
+    attrs = {k: v for k, v in attrs.items() if v is not None}
 
     # Squeeze singleton dimensions (e.g. (120, 1, 619, 1475) -> (120, 619, 1475))
     images = np.squeeze(images)
@@ -1815,6 +1818,9 @@ def load_waxs_raw(
     }
     if extra_attrs:
         attrs.update(extra_attrs)
+    # Drop None-valued attrs so the DataArray is netCDF/Zarr/Tiled
+    # serializable (those backends reject None in attrs).
+    attrs = {k: v for k, v in attrs.items() if v is not None}
 
     return xr.DataArray(
         images,

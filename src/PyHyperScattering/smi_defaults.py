@@ -203,15 +203,35 @@ class LoaderCalibration:
     constants in :mod:`PyHyperScattering.SMISWAXSLoader`.  External
     callers can introspect "what would the loader use if I pass None?"
     without instantiating the loader.
+
+    The single source of truth is :mod:`SMISWAXSLoader` itself —
+    :data:`LOADER_DEFAULTS` is constructed by reading those constants at
+    import time, so the two cannot drift.
     """
-    saxs_row_delta_px: float = 2.0
-    saxs_col_delta_px: float = 3.0
-    waxs_row_delta_px: float = 0.0
-    waxs_col_delta_px: float = -4.5
-    saxs_distance_delta_mm: float = -20.0
+    saxs_row_delta_px: float
+    saxs_col_delta_px: float
+    waxs_row_delta_px: float
+    waxs_col_delta_px: float
+    saxs_distance_delta_mm: float
 
 
-LOADER_DEFAULTS: LoaderCalibration = LoaderCalibration()
+def _build_loader_defaults() -> "LoaderCalibration":
+    """Read the live constants from SMISWAXSLoader.
+
+    Lazy import so we don't form a circular dependency (SMISWAXSLoader
+    imports from this module for ``classify_detector_field``).
+    """
+    from PyHyperScattering import SMISWAXSLoader as L
+    return LoaderCalibration(
+        saxs_row_delta_px=float(L._SAXS_DEFAULT_BEAM_DELTA_ROW_PX),
+        saxs_col_delta_px=float(L._SAXS_DEFAULT_BEAM_DELTA_COL_PX),
+        waxs_row_delta_px=float(L._WAXS_DEFAULT_BEAM_DELTA_ROW_PX),
+        waxs_col_delta_px=float(L._WAXS_DEFAULT_BEAM_DELTA_COL_PX),
+        saxs_distance_delta_mm=float(L._SAXS_DEFAULT_DISTANCE_DELTA_MM),
+    )
+
+
+LOADER_DEFAULTS: LoaderCalibration = _build_loader_defaults()
 
 
 # ---------------------------------------------------------------------------
