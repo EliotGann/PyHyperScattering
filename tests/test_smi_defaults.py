@@ -138,7 +138,11 @@ def test_loader_defaults_values():
     assert cal.saxs_col_delta_px == 0.0
     assert cal.waxs_row_delta_px == 0.0
     assert cal.waxs_col_delta_px == -4.5
-    assert cal.saxs_distance_delta_mm == -193.0
+    # _SAXS_DEFAULT_DISTANCE_DELTA_MM is overridden by saxs_calibration.json
+    # at import time, so we compare to the live value rather than a hard
+    # number (which would drift each time the calibration is refit).
+    from PyHyperScattering import SMISWAXSLoader as L
+    assert cal.saxs_distance_delta_mm == L._SAXS_DEFAULT_DISTANCE_DELTA_MM
 
 
 def test_bsx_per_arc_deg():

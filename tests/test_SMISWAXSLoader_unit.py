@@ -214,8 +214,11 @@ class TestResolveSAXSGeometry:
         # the baseline values untouched.
         assert geo.beam_center_col_px == pytest.approx(750.0, abs=1.0)
         assert geo.beam_center_row_px == pytest.approx(1170.0, abs=1.0)
-        # SDD: baseline 2050 mm + DISTANCE_DELTA_MM(-193) → 1.857 m
-        assert geo.dist_m == pytest.approx(1.857, abs=0.01)
+        # SDD: baseline 2050 mm + DISTANCE_DELTA_MM → metres.  The delta
+        # is calibration-dependent and may shift when saxs_calibration.json
+        # is regenerated, so check against the live value.
+        expected_sdd_m = (2050.0 + L._SAXS_DEFAULT_DISTANCE_DELTA_MM) / 1000.0
+        assert geo.dist_m == pytest.approx(expected_sdd_m, abs=0.01)
         # Energy: baseline 16100 eV → 16.1 keV
         assert geo.energy_ev == pytest.approx(16100.0)
 
@@ -243,8 +246,10 @@ class TestResolveSAXSGeometry:
         # Truly empty run — no metadata of any kind.
         run = _FakeRun(start={"sample_name": ""})
         geo = L.resolve_saxs_geometry(run)
-        # Default SAXS distance (2000 mm) + delta (-193 mm) → 1.807 m
-        assert geo.dist_m == pytest.approx(1.807, abs=0.01)
+        # Default SAXS distance (2000 mm) + delta → metres (delta is
+        # calibration-dependent; check against the live value).
+        expected_sdd_m = (2000.0 + L._SAXS_DEFAULT_DISTANCE_DELTA_MM) / 1000.0
+        assert geo.dist_m == pytest.approx(expected_sdd_m, abs=0.01)
 
     def test_sample_name_energy_parsing(self):
         run = _FakeRun(start={"sample_name": "foo_4064.00eV_bar"})

@@ -90,12 +90,19 @@ _SAXS_DEFAULT_BEAM_DELTA_COL_PX =  0.0        # additive correction to metadata 
 # scan b0f165c4-203e-4d58-af17-916620b974c2 (regression residuals ≤1 px).
 _SAXS_MOTOR_X_REF_MM: float = 1.88             # baseline EPICS bc_col matches actual at this motor_x
 _SAXS_MOTOR_Y_REF_MM: float = 2.45             # baseline EPICS bc_row matches actual at this motor_y
+_SAXS_MOTOR_Z_REF_MM: float = 0.0              # motor_z reference (BC drift relative to here)
 _SAXS_PIEZO_Z_REF_UM: float = 0.0              # piezo_z reference (offset absorbed in DISTANCE_DELTA)
 # px/mm slopes from regression: motor_x→bc_col slope = 5.821 = 1/0.172 exactly.
 # motor_y→bc_row slope ≈ 5.996 (slightly steeper than nominal; possibly the
 # stage is not perfectly perpendicular).
 _SAXS_BEAM_COL_PX_PER_MOTOR_X_MM: float = +5.8211
 _SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM: float = +5.9963
+# motor_z → BC drift: if the beam is perfectly along the motor_z axis,
+# these are zero.  Non-zero values indicate small misalignment of the
+# beam axis vs the motor_z translation axis, derived from an AGB
+# distance-grid scan (calibrate_smi_z_scan.py).
+_SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM: float = 0.0
+_SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM: float = 0.0
 # piezo_z (μm) → SDD: positive piezo_z moves sample downstream (toward
 # detector?) but with slope close to +1 mm/mm in the fit.  Sign-positive
 # means +piezo → +SDD; verify in subsequent calibrations.
@@ -110,6 +117,88 @@ _WAXS_DEFAULT_BEAM_DELTA_COL_PX = -4.5        # additive correction to metadata 
 _WAXS_DEFAULT_PANEL_OFFSETS_DEG = (-7.0, 0.0, 7.0)
 _WAXS_DEFAULT_PANEL_COL_RANGES  = ((0, 206), (206, 413), (413, 619))
 _WAXS_ROTATION_K = 3                             # np.rot90 k-value
+
+
+# ---------------------------------------------------------------------------
+# Optional JSON override of calibration constants
+# ---------------------------------------------------------------------------
+#
+# At import time we look for a JSON file alongside the bundled masks at
+# ``PyHyperScattering/data/smi/saxs_calibration.json``.  When present, its
+# ``constants`` block overrides any of the ``_SAXS_*`` module-level values
+# above.  This lets a beamline scientist re-calibrate (via
+# ``calibrate_smi_z_scan.py`` and friends) without editing source code.
+#
+# Schema (all keys optional):
+#
+#     {
+#       "_doc": "...",
+#       "source_uid": "...",
+#       "constants": {
+#         "_SAXS_DEFAULT_DISTANCE_DELTA_MM": -203.6,
+#         "_SAXS_MOTOR_X_REF_MM": 1.88,
+#         "_SAXS_MOTOR_Y_REF_MM": 2.45,
+#         "_SAXS_MOTOR_Z_REF_MM": 0.0,
+#         "_SAXS_PIEZO_Z_REF_UM": 0.0,
+#         "_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM": 5.8211,
+#         "_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM": 5.9963,
+#         "_SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM": 0.0,
+#         "_SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM": 0.0,
+#         "_SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM": 0.000988
+#       }
+#     }
+#
+# Unknown keys are ignored with a warning.
+
+def _apply_calibration_override() -> dict | None:
+    """Look for a calibration JSON next to the bundled masks and apply it.
+
+    Returns the loaded JSON payload (for inspection / logging) or ``None``
+    when no override file is present or readable.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    here = _Path(__file__).resolve().parent
+    calib_path = here / "data" / "smi" / "saxs_calibration.json"
+    if not calib_path.exists():
+        return None
+    try:
+        payload = _json.loads(calib_path.read_text())
+    except Exception as exc:  # pragma: no cover
+        import warnings as _warnings
+        _warnings.warn(
+            f"Failed to read SAXS calibration override {calib_path}: {exc}",
+            stacklevel=2,
+        )
+        return None
+    constants = payload.get("constants") or {}
+    globals_ = globals()
+    known = {
+        "_SAXS_DEFAULT_DISTANCE_DELTA_MM",
+        "_SAXS_MOTOR_X_REF_MM", "_SAXS_MOTOR_Y_REF_MM",
+        "_SAXS_MOTOR_Z_REF_MM", "_SAXS_PIEZO_Z_REF_UM",
+        "_SAXS_BEAM_COL_PX_PER_MOTOR_X_MM",
+        "_SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM",
+        "_SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM",
+        "_SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM",
+        "_SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM",
+        "_SAXS_DEFAULT_BEAM_DELTA_ROW_PX",
+        "_SAXS_DEFAULT_BEAM_DELTA_COL_PX",
+    }
+    for name, value in constants.items():
+        if name not in known:
+            import warnings as _warnings
+            _warnings.warn(
+                f"Unknown calibration constant {name!r} in {calib_path}",
+                stacklevel=2,
+            )
+            continue
+        globals_[name] = float(value)
+    return payload
+
+
+_SAXS_CALIBRATION_OVERRIDE = _apply_calibration_override()
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +1048,11 @@ def resolve_saxs_geometry(
         run, "pil2M_motor_y", baseline_keys=("pil2M_motor_y_user_setpoint", "pil2M_motor_y"),
         baseline_ds=baseline,
     )
+    motor_z_mm = _read_first_scalar(
+        run, "pil2M_motor_z",
+        baseline_keys=("pil2M_motor_z_user_setpoint", "pil2M_motor_z"),
+        baseline_ds=baseline,
+    )
     piezo_z_um = _read_first_scalar(
         run, "piezo_z", baseline_keys=("piezo_z_user_setpoint", "piezo_z"),
         baseline_ds=baseline,
@@ -966,12 +1060,19 @@ def resolve_saxs_geometry(
 
     motor_x_ref_mm = float(overrides.get("motor_x_ref_mm", _SAXS_MOTOR_X_REF_MM))
     motor_y_ref_mm = float(overrides.get("motor_y_ref_mm", _SAXS_MOTOR_Y_REF_MM))
+    motor_z_ref_mm = float(overrides.get("motor_z_ref_mm", _SAXS_MOTOR_Z_REF_MM))
     piezo_z_ref_um = float(overrides.get("piezo_z_ref_um", _SAXS_PIEZO_Z_REF_UM))
     col_per_mx = float(
         overrides.get("beam_col_px_per_motor_x_mm", _SAXS_BEAM_COL_PX_PER_MOTOR_X_MM)
     )
     row_per_my = float(
         overrides.get("beam_row_px_per_motor_y_mm", _SAXS_BEAM_ROW_PX_PER_MOTOR_Y_MM)
+    )
+    col_per_mz = float(
+        overrides.get("beam_col_px_per_motor_z_mm", _SAXS_BEAM_COL_PX_PER_MOTOR_Z_MM)
+    )
+    row_per_mz = float(
+        overrides.get("beam_row_px_per_motor_z_mm", _SAXS_BEAM_ROW_PX_PER_MOTOR_Z_MM)
     )
     sdd_per_pz = float(
         overrides.get("sdd_delta_mm_per_piezo_z_um", _SAXS_SDD_DELTA_MM_PER_PIEZO_Z_UM)
@@ -981,6 +1082,9 @@ def resolve_saxs_geometry(
         beam_col += (motor_x_mm - motor_x_ref_mm) * col_per_mx
     if motor_y_mm is not None:
         beam_row += (motor_y_mm - motor_y_ref_mm) * row_per_my
+    if motor_z_mm is not None:
+        beam_col += (motor_z_mm - motor_z_ref_mm) * col_per_mz
+        beam_row += (motor_z_mm - motor_z_ref_mm) * row_per_mz
     if piezo_z_um is not None:
         dist_mm += (piezo_z_um - piezo_z_ref_um) * sdd_per_pz
 
@@ -996,12 +1100,6 @@ def resolve_saxs_geometry(
     )
     beam_col += float(
         overrides.get("beam_delta_col_px", _SAXS_DEFAULT_BEAM_DELTA_COL_PX)
-    )
-
-    motor_z_mm = _read_first_scalar(
-        run, "pil2M_motor_z",
-        baseline_keys=("pil2M_motor_z_user_setpoint", "pil2M_motor_z"),
-        baseline_ds=baseline,
     )
 
     return SAXSGeometry(
