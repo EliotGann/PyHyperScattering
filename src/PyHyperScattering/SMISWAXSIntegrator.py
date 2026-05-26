@@ -1567,6 +1567,35 @@ def merge_reduction_results(
 
 @dataclass(frozen=True)
 class CombinedReductionResult:
+    """Reduced SAXS+WAXS data for one SMI run.
+
+    Attributes
+    ----------
+    uid : str
+        Source tiled run UID.
+    scan_info : dict
+        Output of :func:`SMISWAXSLoader.infer_detectors_and_steps` —
+        contains step_candidates, n_frames, sample_name, etc.
+    saxs, waxs : dict or None
+        Per-detector intermediate products (q-maps, per-frame qchi, iq).
+        ``None`` if that detector wasn't present in the scan.
+    merged_qchi : xr.Dataset or None
+        Count-weighted SAXS+WAXS merge on a common ``(q, chi)`` grid.
+        Variables: ``intensity, counts, saxs_intensity, saxs_counts,
+        waxs_intensity, waxs_counts``.
+    merged_iq : xr.Dataset or None
+        Azimuthally-averaged 1-D profile on the merged q grid.
+        Variables: ``I, counts, saxs_I, waxs_I``.
+    per_frame_iq : xr.Dataset or None
+        Per-scan-step I(q).  Dims ``(frame, q)``.  Variables: ``I, saxs_I,
+        waxs_I`` plus any per-frame primary scalars attached as data vars.
+
+    Notes
+    -----
+    For compatibility with PyHyperScattering accessors (``da.rsoxs.*``,
+    ``da.fit.*``), use :meth:`to_dataarray` to extract a single-variable
+    ``xr.DataArray`` view of one of the merged datasets.
+    """
     uid: str
     scan_info: dict[str, Any]
     saxs: dict[str, Any] | None
@@ -1577,6 +1606,76 @@ class CombinedReductionResult:
     timing: dict[str, float] | None = None
     geometry: str = "transmission"
     incident_angle_deg: float = 0.0
+
+    def to_dataarray(
+        self,
+        key: str = "merged_iq",
+        variable: str | None = None,
+    ) -> xr.DataArray:
+        """Extract a single ``xr.DataArray`` view of one merged product.
+
+        The merged outputs are stored as ``xr.Dataset`` (so intensity and
+        counts ride together).  PyHyperScattering's xarray accessors
+        (``da.rsoxs.slice_chi``, ``da.fit.apply``, ...) operate on
+        ``xr.DataArray``, so this helper extracts the intensity variable
+        and attaches reduction provenance as attrs.
+
+        Parameters
+        ----------
+        key : {'merged_iq', 'merged_qchi', 'per_frame_iq'}
+            Which reduction product to extract.
+        variable : str, optional
+            Variable name within the dataset to return.  Defaults to
+            ``'I'`` for the 1-D products and ``'intensity'`` for q-chi.
+
+        Returns
+        -------
+        xr.DataArray
+            With dims appropriate to the requested product and attrs
+            containing ``uid, scan_id, sample_name, geometry,
+            incident_angle_deg`` plus the original dataset's attrs.
+
+        Raises
+        ------
+        ValueError
+            If ``key`` does not name a reduction product, or that product
+            is ``None`` (e.g. requesting merged_qchi for a SAXS-only scan
+            that wasn't merged).
+        """
+        sources = {
+            "merged_iq":    (self.merged_iq, "I"),
+            "merged_qchi":  (self.merged_qchi, "intensity"),
+            "per_frame_iq": (self.per_frame_iq, "I"),
+        }
+        if key not in sources:
+            raise ValueError(
+                f"key must be one of {list(sources)}, got {key!r}"
+            )
+        ds, default_var = sources[key]
+        if ds is None:
+            raise ValueError(
+                f"{key!r} is None — that reduction product wasn't produced "
+                f"(likely because the relevant detector was absent from the scan)."
+            )
+        var = variable or default_var
+        if var not in ds:
+            raise ValueError(
+                f"Variable {var!r} not in {key!r} dataset.  "
+                f"Available: {list(ds.data_vars)}"
+            )
+        da = ds[var]
+        sample_name = (self.scan_info or {}).get("sample_name", "")
+        scan_id = (self.scan_info or {}).get("scan_id")
+        new_attrs = dict(da.attrs)
+        new_attrs.update({
+            "uid":                self.uid,
+            "scan_id":            scan_id,
+            "sample_name":        sample_name,
+            "geometry":           self.geometry,
+            "incident_angle_deg": self.incident_angle_deg,
+            "source":             key,
+        })
+        return da.assign_attrs(new_attrs)
 
 
 @dataclass(frozen=True)

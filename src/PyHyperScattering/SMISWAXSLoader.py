@@ -20,6 +20,7 @@ Design principles
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -1596,7 +1597,7 @@ def load_saxs_raw(
         "pixel1":     geo.pixel1_m,
         "pixel2":     geo.pixel2_m,
         "energy":     geo.energy_ev,
-        "wavelength": geo.wavelength_m * 1e10,   # angstroms (PyHyperScattering convention)
+        "wavelength": geo.wavelength_m,          # metres, consistent with SST1RSoXSLoader
         # SMI-specific
         "smi_detector":           "saxs_pil2M",
         "smi_energy_kev":         geo.energy_ev / 1000.0,
@@ -1670,6 +1671,17 @@ def load_waxs_raw(
     """
     Load WAXS (900KW) raw images from a tiled run as an xr.DataArray.
 
+    .. warning::
+       The returned DataArray's geometry attrs (``dist, poni1, poni2``, …)
+       describe only the **centre panel** of the 3-panel folded arc, and the
+       off-centre panels are physically tilted ±7° out of that plane.  Passing
+       this DataArray to ``PFGeneralIntegrator`` (which assumes a single flat
+       detector) will silently produce incorrect q-values for the outer
+       panels.  Always integrate WAXS via
+       :class:`PyHyperScattering.SMISWAXSIntegrator.SMISWAXSIntegrator` or
+       :func:`PyHyperScattering.SMISWAXSIntegrator.reduce_smi_combined`,
+       which models the panel geometry exactly via ``MultiPanelArcDetector``.
+
     Parameters
     ----------
     image_cache_path : str, Path, or None
@@ -1681,7 +1693,9 @@ def load_waxs_raw(
     xr.DataArray
         dims: (waxs_arc, pix_y, pix_x)
         coords: waxs_arc — arc motor angles in degrees
-        attrs: PyHyperScattering-compatible + SMI WAXS panel geometry
+        attrs: PyHyperScattering-compatible geometry contract (centre panel)
+            + SMI WAXS panel geometry under ``smi_panels`` (JSON-encoded;
+            decode with ``json.loads(da.attrs['smi_panels'])``)
     """
     images = None
     _t_img = time.perf_counter()
@@ -1775,7 +1789,7 @@ def load_waxs_raw(
         "pixel1":     geo.pixel_m,
         "pixel2":     geo.pixel_m,
         "energy":     geo.energy_ev,
-        "wavelength": geo.wavelength_m * 1e10,   # angstroms
+        "wavelength": geo.wavelength_m,          # metres, consistent with SST1RSoXSLoader
         # SMI WAXS-specific
         "smi_detector":              "waxs_pil900KW",
         "smi_energy_kev":            geo.energy_ev / 1000.0,
@@ -1786,7 +1800,11 @@ def load_waxs_raw(
         "smi_sample_offset_x_mm":    geo.sample_offset_x_mm,
         "smi_sample_offset_z_mm":    geo.sample_offset_z_mm,
         "smi_rotation_k":            geo.rotation_k,
-        "smi_panels":                panels_attr,
+        # smi_panels is a list of dicts (panel geometry).  Stored as a JSON
+        # string so the DataArray is round-trippable through netCDF/Zarr and
+        # Tiled, which reject nested objects in attrs.  Decode with
+        # json.loads(da.attrs['smi_panels']).
+        "smi_panels":                json.dumps(panels_attr),
         "smi_waxs_bsx_per_frame":    bsx_values.tolist(),
         "smi_energy_per_frame_ev":   energy_per_frame_ev.tolist(),
         "smi_incident_angle_deg":    incident_angle_deg,
@@ -2089,7 +2107,40 @@ class TiledSMISWAXSLoader:
     Tiled-based loader for the SMI WAXS + SAXS instrument.
 
     Mirrors the attribute/return contract expected by PyHyperScattering
-    (PFGeneralIntegrator with geomethod='template_xr').
+    (``PFGeneralIntegrator`` with ``geomethod='template_xr'``) so that SAXS
+    DataArrays produced by this loader can be integrated by the standard
+    pipeline.  See "Compatibility" below for the WAXS exception.
+
+    Design note: NOT a ``FileLoader`` subclass
+    ------------------------------------------
+    Unlike ``SST1RSoXSLoader`` / ``ALS11012RSoXSLoader`` / ``CMSGIWAXSLoader``,
+    this class deliberately does NOT inherit from
+    :class:`PyHyperScattering.FileLoader.FileLoader`.  The reason is that
+    ``FileLoader`` models its data source as a directory of files indexed by
+    path (``loadSingleImage(filepath)``, ``loadFileSeries(basepath, dims)``),
+    while SMI data lives in a remote Tiled catalog indexed by run UID.  The
+    equivalent design pattern is :class:`SST1RSoXSDB` (also Tiled-native).
+
+    The public entry points here are therefore:
+
+    * ``loadSingleImage(uid, detector='saxs' | 'waxs', ...)`` — load one run
+    * ``loadRun(uid, ...)`` — load both detectors at once
+    * ``searchCatalog(...)`` / ``browseCatalog(...)`` — discover runs
+
+    Compatibility with PyHyperScattering integrators
+    ------------------------------------------------
+    * **SAXS** raw DataArrays (dims ``['pix_y', 'pix_x']`` or
+      ``['frame', 'pix_y', 'pix_x']``) carry the full PyHyper geometry
+      contract (``dist, poni1, poni2, pixel1, pixel2, energy, wavelength``)
+      and can be passed directly to
+      ``PFGeneralIntegrator(geomethod='template_xr')``.
+
+    * **WAXS** raw DataArrays (dims ``['waxs_arc', 'pix_y', 'pix_x']``)
+      describe a 3-panel folded arc detector whose geometry cannot be
+      modeled with the single flat-panel pyFAI assumption used by
+      ``PFGeneralIntegrator``.  Always use
+      :class:`PyHyperScattering.SMISWAXSIntegrator.SMISWAXSIntegrator` (or
+      the ``reduce_smi_combined`` function) for WAXS reduction.
 
     Parameters
     ----------
