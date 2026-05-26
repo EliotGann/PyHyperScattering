@@ -310,8 +310,13 @@ class TestLoadSAXSRaw:
         # SMI-specific
         assert da.attrs["smi_detector"] == "saxs_pil2M"
 
-    def test_wavelength_attr_in_metres(self):
-        """wavelength attr should be in metres to match SST1RSoXSLoader."""
+    def test_wavelength_attr_in_angstroms(self):
+        """wavelength attr is in Ångstroms — that's what SMISWAXSIntegrator expects.
+
+        SMISWAXSIntegrator.integrate_saxs reads ``attrs['wavelength']``
+        and converts via ``× 1e-10`` to metres.  If we stored metres
+        here, q-values would come out 10^10× too large.
+        """
         images = np.zeros((1, 4, 5), dtype=np.int32)
         run = _FakeRun(primary_fields={L.SAXS_IMAGE_FIELD: images})
         geo = L.SAXSGeometry(
@@ -320,12 +325,12 @@ class TestLoadSAXSRaw:
             wavelength_m=7.7008e-11,
         )
         da = L.load_saxs_raw(run, geo)
-        # wavelength in metres is ~1e-10; in Ångstroms it would be ~1
-        assert da.attrs["wavelength"] < 1e-8, (
-            "wavelength attr should be in metres "
-            f"(got {da.attrs['wavelength']} which looks like Ångstroms)"
+        # 16.1 keV ⇒ ~0.77 Å ⇒ attr should be order-unity, not 1e-11
+        assert 0.1 < da.attrs["wavelength"] < 10, (
+            "wavelength attr should be in Ångstroms (order ~1) "
+            f"— got {da.attrs['wavelength']}"
         )
-        assert da.attrs["wavelength"] == pytest.approx(7.7008e-11, rel=1e-3)
+        assert da.attrs["wavelength"] == pytest.approx(0.77008, rel=1e-3)
 
     def test_dim_order_single_frame(self):
         run = _FakeRun(
@@ -357,6 +362,116 @@ class TestLoadSAXSRaw:
         da = L.load_saxs_raw(run, geo)
         nones = [k for k, v in da.attrs.items() if v is None]
         assert not nones, f"loader emitted None-valued attrs: {nones}"
+
+
+# ===========================================================================
+# End-to-end integration smoke test (catches q-unit regressions)
+# ===========================================================================
+
+class TestIntegrateSAXSEndToEnd:
+    """Run ``integrate_saxs`` against a synthetic-but-physical fake run.
+
+    These tests check that *units* (q in nm⁻¹) and *magnitudes* are
+    sensible — the wavelength-attr unit regression (Ångstroms ↔ metres)
+    silently corrupted q values by a factor of 10^10 without raising,
+    producing all-NaN merged_iq.  A unit check at this layer catches
+    that class of bug without requiring a tiled connection.
+    """
+
+    def test_q_grid_in_nm_inverse_units(self):
+        """Resulting q grid must be in nm⁻¹ (order 0.01–100), not m⁻¹.
+
+        Geometry: 16.1 keV at SDD=2 m on a Pilatus 2M produces a max q
+        of about 5 nm⁻¹ at the detector corner.  Anything above ~1000
+        means wavelength is in the wrong unit.
+        """
+        from PyHyperScattering.SMISWAXSIntegrator import integrate_saxs
+
+        # 17×17 image so the integrator has enough pixels to bin.
+        # The detector is small enough that the corner q is well-defined.
+        ny, nx = 17, 17
+        images = np.ones((1, ny, nx), dtype=np.float32)
+        run = _FakeRun(primary_fields={L.SAXS_IMAGE_FIELD: images})
+
+        # Realistic SMI SAXS at 16.1 keV, SDD=2 m, beam in middle
+        # of the (tiny) detector.  Use the actual Pilatus pixel size.
+        geo = L.SAXSGeometry(
+            dist_m=2.0,
+            poni1_m=(ny / 2) * L.PILATUS_PIXEL_SIZE_M,
+            poni2_m=(nx / 2) * L.PILATUS_PIXEL_SIZE_M,
+            pixel1_m=L.PILATUS_PIXEL_SIZE_M,
+            pixel2_m=L.PILATUS_PIXEL_SIZE_M,
+            energy_ev=16100.0,
+            wavelength_m=7.7008e-11,
+            beam_center_row_px=ny / 2,
+            beam_center_col_px=nx / 2,
+        )
+        saxs_raw = L.load_saxs_raw(run, geo)
+
+        result = integrate_saxs(
+            saxs_raw=saxs_raw,
+            mask=None,
+            n_q=200, n_chi=90,
+            beam_center_col_px=nx / 2,
+            solid_angle_correction=False,
+            dezinger_threshold=None,
+            cache_geometry=False,
+        )
+        q = np.asarray(result["q_chi"]["q"].values, dtype=float)
+        # For a 17×17 sub-detector at 2 m with λ ≈ 0.77 Å, corner q is
+        # ~0.01 nm⁻¹.  We assert a generous physical range: q must be
+        # in (0, 1000) nm⁻¹.  A unit mistake (10^10× error from a m/Å
+        # mismatch) would put q at ~10^9 — instantly fails the upper
+        # bound.
+        assert q.max() > 0, f"q max should be positive, got {q.max()}"
+        assert q.max() < 1000, (
+            f"q max = {q.max():.3g} nm⁻¹ is unphysically large.  "
+            f"This usually means attrs['wavelength'] is in the wrong "
+            f"unit (loader stores metres but integrator expects Å, "
+            f"or vice versa)."
+        )
+
+    def test_integrate_saxs_via_attrs_consistent_with_loader(self):
+        """Round-trip: integrating a freshly-loaded DataArray must yield
+        finite intensities (catches attrs-vs-integrator unit mismatches)."""
+        from PyHyperScattering.SMISWAXSIntegrator import integrate_saxs
+
+        ny, nx = 17, 17
+        # Use a small Gaussian-like intensity bump so binning produces
+        # non-NaN bins with content.
+        rr, cc = np.indices((ny, nx))
+        r0, c0 = ny / 2, nx / 2
+        bump = np.exp(-((rr - r0) ** 2 + (cc - c0) ** 2) / 8.0)
+        images = bump[np.newaxis].astype(np.float32) * 1000.0
+        run = _FakeRun(primary_fields={L.SAXS_IMAGE_FIELD: images})
+
+        geo = L.SAXSGeometry(
+            dist_m=2.0,
+            poni1_m=r0 * L.PILATUS_PIXEL_SIZE_M,
+            poni2_m=c0 * L.PILATUS_PIXEL_SIZE_M,
+            pixel1_m=L.PILATUS_PIXEL_SIZE_M,
+            pixel2_m=L.PILATUS_PIXEL_SIZE_M,
+            energy_ev=16100.0,
+            wavelength_m=7.7008e-11,
+            beam_center_row_px=r0,
+            beam_center_col_px=c0,
+        )
+        saxs_raw = L.load_saxs_raw(run, geo)
+        result = integrate_saxs(
+            saxs_raw=saxs_raw, mask=None,
+            n_q=200, n_chi=90,
+            beam_center_col_px=c0,
+            solid_angle_correction=False,
+            dezinger_threshold=None,
+            cache_geometry=False,
+        )
+        I = np.asarray(result["iq"]["I"].values, dtype=float)
+        finite_count = int(np.isfinite(I).sum())
+        # Most q-bins should have data given a small detector
+        assert finite_count > 0, (
+            "All q-bins are NaN — likely a unit-mismatch between the "
+            "loader's wavelength attr and the integrator's expectation."
+        )
 
 
 class TestLoadWAXSRaw:

@@ -135,19 +135,21 @@ def test_smi_panels_is_json_string():
     assert decoded[1]["col_start"] == 206
 
 
-def test_wavelength_attr_is_metres():
-    """wavelength attr should be in metres, consistent with SST1RSoXSLoader."""
+def test_wavelength_attr_is_angstroms():
+    """wavelength attr must be in Ångstroms — SMISWAXSIntegrator depends on this.
+
+    SMISWAXSIntegrator.integrate_saxs reads ``attrs['wavelength']`` and
+    converts via ``× 1e-10`` to metres.  If the loader stored metres
+    instead, q would come out 10^10× too large and the merged_iq would
+    be all-NaN (since q would land outside the bin range).
+    """
     import inspect
     from PyHyperScattering.SMISWAXSLoader import load_saxs_raw, load_waxs_raw
 
     for fn in (load_saxs_raw, load_waxs_raw):
         src = inspect.getsource(fn)
-        # The attr line should be `geo.wavelength_m` (metres),
-        # not `geo.wavelength_m * 1e10` (Ångstroms).
-        assert '"wavelength": geo.wavelength_m,' in src, (
-            f"{fn.__name__} should store wavelength in metres "
-            f"(found: not `geo.wavelength_m,`)"
-        )
-        assert '"wavelength": geo.wavelength_m * 1e10' not in src, (
-            f"{fn.__name__} should NOT store wavelength in Ångstroms"
+        assert '"wavelength": geo.wavelength_m * 1e10' in src, (
+            f"{fn.__name__} should store wavelength in Ångstroms "
+            f"(geo.wavelength_m * 1e10) so SMISWAXSIntegrator's "
+            f"× 1e-10 conversion produces metres."
         )

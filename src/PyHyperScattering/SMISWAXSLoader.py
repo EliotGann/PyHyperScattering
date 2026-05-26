@@ -1597,7 +1597,12 @@ def load_saxs_raw(
         "pixel1":     geo.pixel1_m,
         "pixel2":     geo.pixel2_m,
         "energy":     geo.energy_ev,
-        "wavelength": geo.wavelength_m,          # metres, consistent with SST1RSoXSLoader
+        # Ångstroms — required by SMISWAXSIntegrator.integrate_saxs which
+        # reads this attr and converts (× 1e-10) to metres.  Note: this
+        # differs from SST1RSoXSLoader which stores wavelength in metres;
+        # PFGeneralIntegrator derives wavelength from `energy` and doesn't
+        # care which unit is stored here, but SMISWAXSIntegrator does.
+        "wavelength": geo.wavelength_m * 1e10,
         # SMI-specific
         "smi_detector":           "saxs_pil2M",
         "smi_energy_kev":         geo.energy_ev / 1000.0,
@@ -1792,7 +1797,8 @@ def load_waxs_raw(
         "pixel1":     geo.pixel_m,
         "pixel2":     geo.pixel_m,
         "energy":     geo.energy_ev,
-        "wavelength": geo.wavelength_m,          # metres, consistent with SST1RSoXSLoader
+        # Ångstroms — required by SMISWAXSIntegrator (see load_saxs_raw note).
+        "wavelength": geo.wavelength_m * 1e10,
         # SMI WAXS-specific
         "smi_detector":              "waxs_pil900KW",
         "smi_energy_kev":            geo.energy_ev / 1000.0,
