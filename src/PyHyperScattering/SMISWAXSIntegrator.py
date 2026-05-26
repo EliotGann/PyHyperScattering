@@ -24,6 +24,84 @@ Key classes / functions
 - ``integrate_saxs``         – SAXS integration from raw DataArray
 - ``integrate_waxs``         – WAXS integration from raw DataArray
 - ``reduce_smi_combined``    – Full SAXS + WAXS pipeline returning merged result
+
+Mask architecture
+-----------------
+SMI masking is built up in three layers, applied as a logical AND in this
+order:
+
+**Layer 1 — Fixed instrument geometry.**  Inter-module gaps and bad-pixel
+regions on each detector.  These are physically wired into the hardware
+and never move.  Shipped in the bundled JSON mask files
+(``pil2M_mask_polygons.json``, ``900KW_mask_polygons.json``) under the
+``static_regions`` block (SAXS) or as flat top-level polygons (WAXS).
+
+**Layer 2 — Beamstop polygon, position-corrected from motor readings.**
+SAXS has two beamstop variants (``rod`` and ``pin``) under
+``beamstops``; the integrator reads ``pil2M_active_beamstop`` from
+baseline to choose.  Polygon position uses one of:
+
+* ``polygon_offsets_from_beam`` *(preferred)* — anchored to the
+  per-frame beam center, which already tracks ``pil2M_motor_x/y`` and
+  ``piezo_z``.
+* ``polygon`` + ``reference_mm`` + ``pixels_per_mm`` *(legacy)* —
+  shifted by ``(motor − reference) × px_per_mm``.
+
+WAXS has a single beamstop polygon that shifts vertically by
+``(waxs_bsx − waxs_bsx_ref) / pixel_size × 1.088``.  The reference is
+derived from the SMI mechanical linkage
+``waxs_bsx_ref = waxs_bsx − BSX_PER_ARC_DEG × waxs_arc``.  Auto-disabled
+when ``|waxs_arc| > beamstop_max_abs_arc_deg`` (default 15°) — the
+beamstop has cleared the active area.
+
+**Layer 3 — Dynamic per-frame occlusion (SAXS only).**  Two extra masks
+computed during integration:
+
+* **WAXS-shadow mask** — the WAXS detector physically blocks part of the
+  SAXS detector's view; the boundary column moves with ``waxs_arc``
+  (``_make_waxs_shadow_mask``).
+* **Aperture mask** — q-cutoff anchored to an AgBh ring order (default
+  5) at the current SDD; auto-disables when the cutoff falls beyond the
+  detector edge (long SDD).  (``_make_aperture_mask``)
+
+Override knobs
+~~~~~~~~~~~~~~
+Layers 2 and 3 are independently togglable via :func:`reduce_smi_combined`::
+
+    reduce_smi_combined(
+        uid,
+        saxs_mask=my_dict_or_path_or_None,    # Layer 1+2 source
+        waxs_mask=my_dict_or_path_or_None,    # Layer 1+2 source (WAXS)
+        saxs_kwargs={
+            "dynamic_saxs_kwargs": {
+                "aperture":    {"enabled": False},    # Layer 3a off
+                "waxs_shadow": {"enabled": False},    # Layer 3b off
+            }
+        },
+        saxs_q_cutoff=0.6,           # force aperture cutoff (nm⁻¹)
+        saxs_agbh_ring_order=8,      # change anchor ring
+    )
+
+Mask inputs (Path *or* dict)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+All public mask entry points accept either a path to a JSON file or an
+already-parsed dict with the same schema.  The dict form lets notebook
+users compose and edit masks in memory:
+
+.. code-block:: python
+
+    import json
+    spec = json.load(open(default_saxs_mask_path()))
+    spec["static_regions"]["my_extra_blob"] = [[100, 200], [150, 200], ...]
+    result = reduce_smi_combined(uid, saxs_mask=spec)
+
+Functions taking either form:
+
+* :func:`make_saxs_mask_from_spec` / :func:`make_saxs_mask_from_dict`
+* :func:`make_waxs_mask_callable` / :func:`make_waxs_mask_callable_from_dict`
+* :func:`mask_for_frame` (via ``mask_path=`` accepting dict)
+* :func:`reduce_smi_combined` (``saxs_mask=`` / ``waxs_mask=`` kwargs)
+* :func:`reduce_smi_gi` (``waxs_mask=`` kwarg)
 """
 from __future__ import annotations
 
@@ -510,14 +588,55 @@ def make_mask_for_angle(
 # SAXS mask builders
 # ===================================================================
 
-def make_saxs_mask_from_spec(
+def _resolve_mask_spec(spec: "str | Path | dict") -> dict:
+    """Resolve a mask spec input to a parsed dict.
+
+    Accepts either a file path (str or pathlib.Path) pointing to a JSON
+    mask file, or an already-parsed dict in the same schema.  The dict
+    form lets notebook users compose and edit masks in memory without
+    writing temp files.
+    """
+    if isinstance(spec, dict):
+        return spec
+    with open(spec) as f:
+        return json.load(f)
+
+
+def make_saxs_mask_from_dict(
     image_shape: tuple[int, int],
-    mask_path: str | Path,
+    mask_spec: dict,
     active_beamstop: str = "rod",
     beamstop_pos_mm: dict | None = None,
     beam_center_px: tuple[float, float] | None = None,
 ) -> np.ndarray:
-    """Build a static SAXS mask (True = valid) from a JSON mask spec.
+    """Build a static SAXS mask (True = valid) from a parsed mask dict.
+
+    This is the in-memory variant of :func:`make_saxs_mask_from_spec` —
+    use it when you have the mask polygons in a Python dict (perhaps
+    built up from a notebook UI or assembled programmatically) and don't
+    want to serialize to a temp file first.
+
+    The expected schema matches the bundled JSON mask files:
+
+    .. code-block:: python
+
+        {
+            "image_shape": [rows, cols],          # optional, informational
+            "static_regions": {
+                "gap_1": [[col, row], [col, row], ...],   # one polygon per key
+                "gap_2": [...],
+            },
+            "beamstops": {
+                "rod": {                          # one entry per beamstop variant
+                    "polygon_offsets_from_beam": [[d_col, d_row], ...],
+                    # OR (legacy form):
+                    "polygon": [[col, row], ...],
+                    "reference_mm": {"x": 0.0, "y": 0.0},
+                    "pixels_per_mm": {"x": 5.81, "y": 5.81},
+                },
+                "pin": { ... },
+            },
+        }
 
     Beamstop polygons may be specified in two ways:
 
@@ -536,8 +655,8 @@ def make_saxs_mask_from_spec(
     ----------
     image_shape : (rows, cols)
         Raw detector image shape.
-    mask_path : path-like
-        JSON polygon spec.
+    mask_spec : dict
+        Parsed polygon spec (see schema above).
     active_beamstop : {'rod', 'pin'} or other key present in mask spec
         Which beamstop is currently in the beam.  Selects the matching
         polygon (or polygons) from the ``beamstops`` block.
@@ -546,10 +665,12 @@ def make_saxs_mask_from_spec(
     beam_center_px : (row, col) | None
         Resolved beam center in raw-detector pixel coordinates.  Required
         when a beamstop entry uses ``polygon_offsets_from_beam``.
-    """
-    with open(mask_path) as f:
-        mask_spec = json.load(f)
 
+    Returns
+    -------
+    np.ndarray[bool]
+        Boolean mask; ``True`` marks a valid pixel.
+    """
     static_regions = mask_spec.get("static_regions", {})
     beamstops_spec = mask_spec.get("beamstops", {})
     polys = list(static_regions.values())
@@ -607,15 +728,83 @@ def make_saxs_mask_from_spec(
     return polygons_to_mask(image_shape, polys)
 
 
-def make_waxs_mask_callable(
-    mask_path: str | Path,
+def make_saxs_mask_from_spec(
+    image_shape: tuple[int, int],
+    mask_path: "str | Path | dict",
+    active_beamstop: str = "rod",
+    beamstop_pos_mm: dict | None = None,
+    beam_center_px: tuple[float, float] | None = None,
+) -> np.ndarray:
+    """Build a static SAXS mask from a JSON mask file *or* parsed dict.
+
+    Thin wrapper around :func:`make_saxs_mask_from_dict`: when
+    *mask_path* is a string or :class:`~pathlib.Path`, the JSON is loaded
+    from disk; when it's a ``dict`` the parsed contents are used
+    directly (no file I/O).
+
+    All other arguments and the return value are documented in
+    :func:`make_saxs_mask_from_dict`.
+    """
+    mask_spec = _resolve_mask_spec(mask_path)
+    return make_saxs_mask_from_dict(
+        image_shape=image_shape,
+        mask_spec=mask_spec,
+        active_beamstop=active_beamstop,
+        beamstop_pos_mm=beamstop_pos_mm,
+        beam_center_px=beam_center_px,
+    )
+
+
+def make_waxs_mask_callable_from_dict(
+    mask_data: dict,
     waxs_bsx_ref: float = 0.0,
     beamstop_max_abs_arc_deg: float | None = 15.0,
 ):
-    """Return ``mask_fn(image_shape_raw, theta_deg, waxs_bsx) → bool mask``."""
-    with open(mask_path) as f:
-        mask_data = json.load(f)
+    """Return a per-frame WAXS mask function built from a parsed dict.
 
+    Two schemas are accepted:
+
+    1. **Nested** (matches the bundled SAXS schema)::
+
+           {
+               "static_regions": {"gap_upper": [...], "bad_module": [...]},
+               "beamstops": {"beamstop": <polygon-or-wrapper>},
+           }
+
+       where ``<polygon-or-wrapper>`` is either a bare polygon
+       (``[[col, row], ...]``) or a wrapper ``{"polygons": [[...]]}``.
+
+    2. **Flat** (legacy, matches the bundled WAXS file)::
+
+           {
+               "gap_upper":  [[col, row], ...],
+               "bad_module": [[col, row], ...],
+               "beamstop":   [[col, row], ...],
+           }
+
+       The ``beamstop`` key is the moving region; everything else is
+       treated as static.
+
+    Returns
+    -------
+    callable
+        ``mask_fn(image_shape_raw, theta_deg, waxs_bsx) -> ndarray[bool]``,
+        returning a mask already rotated to display orientation
+        (``np.fliplr(np.rot90(..., k=3))`` applied internally).
+
+    Parameters
+    ----------
+    mask_data : dict
+        Parsed polygon spec.
+    waxs_bsx_ref : float
+        Reference ``waxs_bsx`` value used to compute beamstop polygon
+        shift.  Per-frame ``(waxs_bsx − waxs_bsx_ref)`` drives a vertical
+        polygon shift via the SMI mechanical linkage.
+    beamstop_max_abs_arc_deg : float or None
+        Skip the beamstop polygon when ``|theta_deg|`` exceeds this
+        value (the beamstop has cleared the active area).  ``None``
+        keeps the beamstop active at every angle.
+    """
     if "static_regions" in mask_data or "beamstops" in mask_data:
         static_regions = mask_data.get("static_regions", {})
         bs_entry = mask_data.get("beamstops", {}).get("beamstop", {})
@@ -651,6 +840,31 @@ def make_waxs_mask_callable(
         )
 
     return mask_fn
+
+
+def make_waxs_mask_callable(
+    mask_path: "str | Path | dict",
+    waxs_bsx_ref: float = 0.0,
+    beamstop_max_abs_arc_deg: float | None = 15.0,
+):
+    """Return a per-frame WAXS mask function built from a path or dict.
+
+    Thin wrapper around :func:`make_waxs_mask_callable_from_dict`: loads
+    the JSON when *mask_path* is a string or :class:`~pathlib.Path`,
+    passes through when it's a ``dict``.  All other parameters are
+    documented in :func:`make_waxs_mask_callable_from_dict`.
+
+    Returns
+    -------
+    callable
+        ``mask_fn(image_shape_raw, theta_deg, waxs_bsx) -> bool mask``
+    """
+    mask_data = _resolve_mask_spec(mask_path)
+    return make_waxs_mask_callable_from_dict(
+        mask_data=mask_data,
+        waxs_bsx_ref=waxs_bsx_ref,
+        beamstop_max_abs_arc_deg=beamstop_max_abs_arc_deg,
+    )
 
 
 # ===================================================================
@@ -760,7 +974,7 @@ def mask_for_frame(
     frame_idx: int,
     detector: str,
     *,
-    mask_path: str | Path | None = None,
+    mask_path: "str | Path | dict | None" = None,
     orient_for_display: bool = False,
     tiled_uri: str | None = None,
     catalog: str | None = None,
@@ -784,9 +998,10 @@ def mask_for_frame(
         SAXS in current SMI configuration but accepted for symmetry.
     detector : {'saxs', 'waxs'}
         Which detector's mask to build.
-    mask_path : str | Path | None, optional
-        Polygon-mask JSON path.  ``None`` selects the bundled default
-        from :func:`smi_defaults.resolve_mask_path`.
+    mask_path : str, Path, dict, or None
+        Polygon-mask JSON path *or* already-parsed polygon dict.
+        ``None`` selects the bundled default from
+        :func:`smi_defaults.resolve_mask_path`.
     orient_for_display : bool, optional
         If True, return the mask already aligned with
         :func:`smi_defaults.orient_frame_for_display`.  For WAXS the
@@ -844,7 +1059,12 @@ def mask_for_frame(
         raw_shape = _smi_run_raw_shape(run, image_field)
     raw_shape = (int(raw_shape[0]), int(raw_shape[1]))
 
-    resolved_mask_path = _resolve_mask_path(mask_path, detector=det)
+    # Dict inputs bypass the path-based resolver; otherwise let the
+    # resolver apply bundled-default fallback.
+    if isinstance(mask_path, dict):
+        resolved_mask_path = mask_path
+    else:
+        resolved_mask_path = _resolve_mask_path(mask_path, detector=det)
 
     if det == "saxs":
         # Pull the actual active beamstop + per-run motor positions from
@@ -2067,7 +2287,8 @@ def reduce_smi_gi(
     uid: str,
     tiled_uri: str = "https://tiled.nsls2.bnl.gov",
     catalog: str = "smi/migration",
-    waxs_mask_path: str | Path | None = None,
+    waxs_mask: "str | Path | dict | None" = None,
+    waxs_mask_path: "str | Path | None" = None,
     n_qxy: int = 500,
     n_qz: int = 500,
     incident_angle_deg: float | None = None,
@@ -2089,10 +2310,15 @@ def reduce_smi_gi(
         Tiled run UID.
     tiled_uri, catalog : str
         Tiled connection parameters.
-    waxs_mask_path : str or Path or None
-        Path to the WAXS mask JSON.  ``None`` (the default) uses the
-        bundled SMI default mask shipped with PyHyperScattering
+    waxs_mask : str, Path, dict, or None
+        WAXS mask spec.  Accepts a JSON file path, a Path, an in-memory
+        dict (same schema as the bundled JSON; see
+        :func:`make_waxs_mask_callable_from_dict`), or ``None`` to use
+        the bundled SMI default mask shipped with PyHyperScattering
         (``PyHyperScattering.smi_defaults.default_waxs_mask_path``).
+    waxs_mask_path : str or Path or None
+        Deprecated alias for ``waxs_mask`` (Path only).  When both are
+        supplied, ``waxs_mask`` wins.
     n_qxy, n_qz : int
         Output grid dimensions.
     incident_angle_deg : float or None
@@ -2190,12 +2416,16 @@ def reduce_smi_gi(
             pass  # cache write is best-effort
 
     # --- Mask ---
+    # waxs_mask (new, accepts dict) wins over waxs_mask_path (legacy)
+    if waxs_mask is None:
+        waxs_mask = waxs_mask_path
     from PyHyperScattering.smi_defaults import resolve_mask_path
-    waxs_mask_path = resolve_mask_path(waxs_mask_path, detector="waxs")
+    if not isinstance(waxs_mask, dict):
+        waxs_mask = resolve_mask_path(waxs_mask, detector="waxs")
     waxs_mask_fn = None
-    if waxs_mask_path is not None:
+    if waxs_mask is not None:
         waxs_mask_fn = make_waxs_mask_callable(
-            waxs_mask_path,
+            waxs_mask,                                  # accepts dict or Path
             beamstop_max_abs_arc_deg=beamstop_max_abs_arc_deg,
         )
 
@@ -2732,8 +2962,10 @@ def reduce_smi_combined(
     n_q: int = 2000,
     n_chi: int = 360,
     solid_angle_correction: bool = True,
-    saxs_mask_path: str | Path | None = None,
-    waxs_mask_path: str | Path | None = None,
+    saxs_mask: "str | Path | dict | None" = None,
+    waxs_mask: "str | Path | dict | None" = None,
+    saxs_mask_path: "str | Path | None" = None,
+    waxs_mask_path: "str | Path | None" = None,
     saxs_kwargs: dict[str, Any] | None = None,
     waxs_kwargs: dict[str, Any] | None = None,
     backend_options: dict[str, Any] | None = None,
@@ -2766,11 +2998,23 @@ def reduce_smi_combined(
         Output grid dimensions.
     solid_angle_correction : bool
         Apply solid-angle correction to intensities.
+    saxs_mask, waxs_mask : str, Path, dict, or None
+        Mask specification.  Accepts:
+
+        * ``None`` (default) — bundled SMI default mask
+          (see :mod:`PyHyperScattering.smi_defaults`).
+        * ``str`` or ``Path`` — JSON file path; same schema as the
+          bundled masks.
+        * ``dict`` — already-parsed polygon dict (the JSON contents).
+          Useful when composing or editing masks in a notebook without
+          writing a temp file.  See
+          :func:`make_saxs_mask_from_dict` /
+          :func:`make_waxs_mask_callable_from_dict` for the schema.
     saxs_mask_path, waxs_mask_path : str or Path, optional
-        JSON mask specification files. ``None`` (the default) uses the
-        bundled SMI default masks shipped with PyHyperScattering
-        (see ``PyHyperScattering.smi_defaults``). Pass an explicit path
-        to override.
+        Deprecated alias for ``saxs_mask`` / ``waxs_mask`` (accepts
+        Path or str only).  Provided for backward compatibility with
+        callers written before in-memory dict input was supported.
+        When both are supplied, ``saxs_mask`` / ``waxs_mask`` wins.
     saxs_kwargs, waxs_kwargs : dict, optional
         Extra options passed to SAXS / WAXS integrators.
     backend_options : dict, optional
@@ -2850,6 +3094,15 @@ def reduce_smi_combined(
     opts = dict(backend_options or {})
     t0 = _time.perf_counter()
 
+    # Resolve mask inputs: ``saxs_mask`` / ``waxs_mask`` (new, supports
+    # dict) wins over ``saxs_mask_path`` / ``waxs_mask_path`` (legacy,
+    # Path-only).  The mask builders downstream accept either form via
+    # ``_resolve_mask_spec``, so we just pick the right one here.
+    if saxs_mask is None:
+        saxs_mask = saxs_mask_path
+    if waxs_mask is None:
+        waxs_mask = waxs_mask_path
+
     # Resolve image cache path
     _cache_was_missing = False
     if image_cache_path == "auto":
@@ -2916,15 +3169,19 @@ def reduce_smi_combined(
 
         # SAXS mask
         _t_debug = _time.perf_counter()
-        if saxs_mask_path is None:
-            saxs_mask_path = saxs_kw.pop("mask_path", None)
+        if saxs_mask is None:
+            saxs_mask = saxs_kw.pop("mask_path", None)
+        # When mask is a dict, skip the path-only resolver (which would
+        # only check for file existence anyway); otherwise let it apply
+        # bundled-default fallback for None / bare-filename inputs.
         from PyHyperScattering.smi_defaults import resolve_mask_path
-        saxs_mask_path = resolve_mask_path(saxs_mask_path, detector="saxs")
-        saxs_mask = None
-        if saxs_mask_path is not None:
-            saxs_mask = make_saxs_mask_from_spec(
+        if not isinstance(saxs_mask, dict):
+            saxs_mask = resolve_mask_path(saxs_mask, detector="saxs")
+        saxs_mask_array = None
+        if saxs_mask is not None:
+            saxs_mask_array = make_saxs_mask_from_spec(
                 image_shape=saxs_raw.shape[-2:],
-                mask_path=saxs_mask_path,
+                mask_path=saxs_mask,                       # accepts dict or Path
                 active_beamstop=saxs_geo.active_beamstop,
                 beamstop_pos_mm=saxs_geo.beamstop_pos_mm,
                 beam_center_px=(
@@ -2947,7 +3204,7 @@ def reduce_smi_combined(
 
         saxs_result = integrate_saxs(
             saxs_raw=saxs_raw,
-            mask=saxs_mask,
+            mask=saxs_mask_array,
             n_q=n_q,
             n_chi=n_chi,
             solid_angle_correction=solid_angle_correction,
@@ -2978,11 +3235,12 @@ def reduce_smi_combined(
         # WAXS mask callable
         _t_debug = _time.perf_counter()
         waxs_mask_fn = None
-        if waxs_mask_path is None:
-            waxs_mask_path = waxs_kw.pop("mask_path", None)
+        if waxs_mask is None:
+            waxs_mask = waxs_kw.pop("mask_path", None)
         from PyHyperScattering.smi_defaults import resolve_mask_path
-        waxs_mask_path = resolve_mask_path(waxs_mask_path, detector="waxs")
-        if waxs_mask_path is not None:
+        if not isinstance(waxs_mask, dict):
+            waxs_mask = resolve_mask_path(waxs_mask, detector="waxs")
+        if waxs_mask is not None:
             waxs_bsx_pf = np.asarray(
                 waxs_raw.attrs.get("smi_waxs_bsx_per_frame", []),
                 dtype=float,
@@ -3021,7 +3279,7 @@ def reduce_smi_combined(
             else:
                 waxs_bsx_ref = 0.0
             waxs_mask_fn = make_waxs_mask_callable(
-                waxs_mask_path,
+                waxs_mask,                                  # accepts dict or Path
                 waxs_bsx_ref=waxs_bsx_ref,
                 beamstop_max_abs_arc_deg=waxs_kw.pop(
                     "beamstop_max_abs_arc_deg", 15.0
